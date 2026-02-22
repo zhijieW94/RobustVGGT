@@ -24,6 +24,9 @@
     <a href="https://github.com/cvlab-kaist/RobustVGGT/releases/download/paper/Emergent.Outlier.View.Rejection.in.Visual.Geometry.Grounded.Transformers.pdf">Paper (High quality)</a> | 
     <a href="https://cvlab-kaist.github.io/RobustVGGT">Project Page</a>
   </h3>
+  <h3 align="center">
+    CVPR 2026
+  </h3>
 </p>
 
 <p align="center">
