@@ -141,7 +141,7 @@ class RobustVGGTExperiment:
         except Exception:
             pass
 
-    def _forward_once(self, images: Tensor, image_hw: tuple[int, int], device: torch.device) -> Tensor:
+    def _forward_once(self, images: Tensor, image_hw: tuple[int, int], device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor, List[int]]:
         import math
         import numpy as np
         import torch
@@ -509,10 +509,12 @@ class RobustVGGTExperiment:
             predictions = predictions_full
 
         pose_enc = predictions["pose_enc"]
-        extrinsics, _ = pose_encoding_to_extri_intri(pose_enc, image_hw)
+        extrinsics, intrinsics = pose_encoding_to_extri_intri(pose_enc, image_hw)
         extrinsics = extrinsics.squeeze(0) if extrinsics.ndim == 4 else extrinsics
+        intrinsics = intrinsics.squeeze(0) if intrinsics.ndim == 4 else intrinsics
         Twc = convert_world_to_cam_to_cam_to_world(extrinsics)
         result = Twc.detach().cpu().float()
+        intrinsics_cpu = intrinsics.detach().cpu().float()
         conf = predictions["depth_conf"].detach().cpu().float()
         depth = predictions["depth"].detach().cpu().float()
 
@@ -523,7 +525,102 @@ class RobustVGGTExperiment:
             pass
         safe_empty_cache()
 
-        return result, depth, conf, rejected_image_indices
+        return result, depth, conf, intrinsics_cpu, rejected_image_indices
+
+    def _save_ply(
+        self,
+        ply_path: Path,
+        images: Tensor,
+        depth: Tensor,
+        conf: Tensor,
+        intrinsics: Tensor,
+        twc: Tensor,
+        image_hw: tuple[int, int],
+        conf_threshold: float = 0.5,
+    ) -> None:
+        """Unproject depth maps into a colored point cloud and write a PLY file.
+
+        All inputs must be pre-aligned: images, depth, conf, intrinsics, and twc
+        should all have the same number of frames (survivors only).
+        """
+        H, W = image_hw
+        # Remove trailing singleton dim: (..., 1) -> (...)
+        if depth.shape[-1] == 1:
+            depth = depth.squeeze(-1)
+        if conf.shape[-1] == 1:
+            conf = conf.squeeze(-1)
+        # Remove batch dim: (1, N, H, W) -> (N, H, W)
+        if depth.ndim == 4:
+            depth = depth.squeeze(0)
+        if conf.ndim == 4:
+            conf = conf.squeeze(0)
+        # images: (N, C, H, W) or (1, N, C, H, W)
+        if images.ndim == 5:
+            images = images.squeeze(0)
+        images_cpu = images.detach().cpu().float()
+
+        N = depth.shape[0]
+
+        # Build pixel grid once
+        v, u = torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing="ij")
+
+        all_points = []
+        all_colors = []
+
+        for idx in range(N):
+            d = depth[idx]  # (H, W)
+            c = conf[idx]   # (H, W)
+            K = intrinsics[idx]  # (3, 3)
+            T = twc[idx]         # (4, 4)
+
+            mask = (c > conf_threshold) & (d > 0)
+
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+
+            z = d[mask]
+            x = (u[mask] - cx) * z / fx
+            y = (v[mask] - cy) * z / fy
+
+            pts_cam = torch.stack([x, y, z], dim=-1)  # (M, 3)
+            ones = torch.ones(pts_cam.shape[0], 1)
+            pts_hom = torch.cat([pts_cam, ones], dim=-1)  # (M, 4)
+            pts_world = (T @ pts_hom.T).T[:, :3]  # (M, 3)
+
+            img = images_cpu[idx].permute(1, 2, 0)  # (H, W, 3)
+            colors = img[mask]  # (M, 3)
+            colors = (colors.clamp(0.0, 1.0) * 255).to(torch.uint8)
+
+            all_points.append(pts_world)
+            all_colors.append(colors)
+
+        if not all_points:
+            info_print("[WARN] No points survived filtering; PLY not written.")
+            return
+
+        all_points = torch.cat(all_points, dim=0).numpy()
+        all_colors = torch.cat(all_colors, dim=0).numpy()
+
+        num_pts = all_points.shape[0]
+        info_print(f"[INFO] Writing {num_pts} points to PLY")
+
+        with open(ply_path, "wb") as f:
+            header = (
+                "ply\n"
+                "format binary_little_endian 1.0\n"
+                f"element vertex {num_pts}\n"
+                "property float x\n"
+                "property float y\n"
+                "property float z\n"
+                "property uchar red\n"
+                "property uchar green\n"
+                "property uchar blue\n"
+                "end_header\n"
+            )
+            f.write(header.encode("ascii"))
+            for i in range(num_pts):
+                f.write(struct.pack("<fff", *all_points[i]))
+                f.write(struct.pack("BBB", *all_colors[i]))
 
     def run_demo(self) -> None:
         self.pair_out_dir = Path(self.config.exp_name)
@@ -550,9 +647,25 @@ class RobustVGGTExperiment:
         if torch.device(self.device).type == "cuda":
             images_tensor = images_tensor.pin_memory()
 
-        image_hw = tuple(int(dim) for dim in images_tensor.shape[-2:])
+        image_hw = (int(images_tensor.shape[-2]), int(images_tensor.shape[-1]))
         
-        pred_twcs, depth, conf, rejected_indices = self._forward_once(images_tensor, image_hw, torch.device(self.device))
+        pred_twcs, depth, conf, intrinsics, rejected_indices = self._forward_once(images_tensor, image_hw, torch.device(self.device))
+
+        # Subset images to match survivor-only predictions
+        if rejected_indices:
+            N_total = images_tensor.shape[1] if images_tensor.ndim == 5 else images_tensor.shape[0]
+            survivor_ids = [i for i in range(N_total) if i not in rejected_indices]
+            if images_tensor.ndim == 5:
+                images_for_ply = images_tensor[:, survivor_ids, ...]
+            else:
+                images_for_ply = images_tensor[survivor_ids, ...]
+        else:
+            images_for_ply = images_tensor
+
+        # Build point cloud and save as PLY
+        ply_path = self.pair_out_dir / "output.ply"
+        self._save_ply(ply_path, images_for_ply, depth, conf, intrinsics, pred_twcs, image_hw)
+        info_print(f"[INFO] Saved PLY to {ply_path}")
 
 
 def parse_args() -> ExperimentConfig:
