@@ -735,12 +735,13 @@ def parse_args() -> ExperimentConfig:
     parser.add_argument("--cos_a", type=float, default=0.5, help="Cosine similarity weight.")
     parser.add_argument("--rej-thresh", type=float, default=0.4, help="Rejection threshold.")
     parser.add_argument(
-        "--use-point-map", action="store_true",
-        help="Use the point-map branch instead of depth unprojection for PLY generation.",
+        "--no-point-map", dest="use_point_map", action="store_false",
+        help="Use depth unprojection instead of the point-map branch for PLY generation.",
     )
+    parser.set_defaults(use_point_map=True)
     parser.add_argument(
-        "--conf-threshold-pct", type=float, default=50.0,
-        help="Discard the bottom N%% of points by confidence score (0–100, default 50).",
+        "--conf-threshold-pct", type=float, default=30.0,
+        help="Discard the bottom N%% of points by confidence score (0–100, default 30).",
     )
 
     args = parser.parse_args()
