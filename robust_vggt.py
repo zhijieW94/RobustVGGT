@@ -710,6 +710,14 @@ class RobustVGGTExperiment:
         except Exception:
             pass
 
+        # Save anchor image (first image)
+        anchor_img = images_tensor[0].detach().cpu().float()
+        anchor_np = anchor_img.permute(1, 2, 0).numpy()
+        anchor_np = np.clip(anchor_np, 0.0, 1.0)
+        anchor_pil = Image.fromarray((anchor_np * 255).astype(np.uint8))
+        anchor_pil.save(self.pair_out_dir / "anchor.png")
+        info_print(f"[INFO] Saved anchor image to {self.pair_out_dir / 'anchor.png'}")
+
         if torch.device(self.device).type == "cuda":
             images_tensor = images_tensor.pin_memory()
 
