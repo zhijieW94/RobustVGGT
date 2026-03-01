@@ -4,10 +4,10 @@ run_vggt.py — Run VGGT inference on a folder of images and save the
 reconstructed 3D scene as a coloured PLY point cloud.
 
 Two point sources are supported (controlled via --use_point_map):
+  • point-map branch (--use_point_map, recommended): world_points predicted
+    directly by the point head → best quality, no pose estimation error.
   • depth branch  (default): depth maps are unprojected using the decoded
-    camera extrinsics / intrinsics  →  more geometry detail.
-  • point-map branch (--use_point_map): world_points predicted directly by
-    the point head  →  slightly faster, no camera math needed.
+    camera extrinsics / intrinsics → alternative if point-map is unavailable.
 
 Usage:
     python run_vggt.py --image_folder path/to/images
@@ -18,7 +18,6 @@ Usage:
 import argparse
 import glob
 import os
-import struct
 
 import numpy as np
 import torch
@@ -27,38 +26,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def save_ply(path: str, points: np.ndarray, colors: np.ndarray) -> None:
-    """Write a binary PLY point cloud (XYZ + RGB)."""
-    assert points.shape[0] == colors.shape[0], \
-        "points and colors must have the same number of rows"
-    num_pts = points.shape[0]
-    print(f"[INFO] Writing {num_pts:,} points → {path}")
-
-    with open(path, "wb") as f:
-        header = (
-            "ply\n"
-            "format binary_little_endian 1.0\n"
-            f"element vertex {num_pts}\n"
-            "property float x\n"
-            "property float y\n"
-            "property float z\n"
-            "property uchar red\n"
-            "property uchar green\n"
-            "property uchar blue\n"
-            "end_header\n"
-        )
-        f.write(header.encode("ascii"))
-        pts_f32 = points.astype(np.float32)
-        col_u8 = colors.astype(np.uint8)
-        for i in range(num_pts):
-            f.write(struct.pack("<fff", *pts_f32[i]))
-            f.write(struct.pack("BBB", *col_u8[i]))
-
-    print(f"[INFO] PLY saved to {path}")
+from robust_vggt import save_ply  # PLY writer lives in robust_vggt
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -76,8 +44,8 @@ def main() -> None:
         help="Output PLY file path (default: output.ply).",
     )
     parser.add_argument(
-        "--conf_threshold", type=float, default=50.0,
-        help="Discard the lowest N%% of points by confidence score (0–100, default 50).",
+        "--conf_threshold", type=float, default=30.0,
+        help="Discard the lowest N%% of points by confidence score (0–100, default 30).",
     )
     parser.add_argument(
         "--use_point_map", action="store_true",

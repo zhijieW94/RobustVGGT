@@ -30,6 +30,7 @@ REPO_ROOT = FILE_PATH.parents[2]
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 def invert_se3(T: torch.Tensor) -> torch.Tensor:
     """Invert batched SE3 matrices."""
@@ -51,6 +52,8 @@ class ExperimentConfig:
     attn_a: float = 0.5
     cos_a: float = 0.5
     rej_thresh: float = 0.4
+    use_point_map: bool = True
+    conf_threshold_pct: float = 30.0
 
 
 def safe_empty_cache() -> None:
@@ -126,6 +129,33 @@ ANSI_GREEN = "\033[92m"
 ANSI_RESET = "\033[0m"
 def info_print(msg: str) -> None:
     print(f"{ANSI_GREEN}{msg}{ANSI_RESET}")
+
+
+def save_ply(path: str, points: np.ndarray, colors: np.ndarray) -> None:
+    """Write a binary little-endian PLY point cloud (XYZ + RGB)."""
+    assert points.shape[0] == colors.shape[0], "points and colors must have the same length"
+    num_pts = points.shape[0]
+    info_print(f"[INFO] Writing {num_pts:,} points → {path}")
+    with open(path, "wb") as f:
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {num_pts}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        f.write(header.encode("ascii"))
+        pts_f32 = points.astype(np.float32)
+        col_u8  = colors.astype(np.uint8)
+        for i in range(num_pts):
+            f.write(struct.pack("<fff", *pts_f32[i]))
+            f.write(struct.pack("BBB",  *col_u8[i]))
+    info_print(f"[INFO] PLY saved to {path}")
 
 
 class RobustVGGTExperiment:
@@ -531,8 +561,18 @@ class RobustVGGTExperiment:
         Twc = convert_world_to_cam_to_cam_to_world(extrinsics)
         result = Twc.detach().cpu().float()
         intrinsics_cpu = intrinsics.detach().cpu().float()
+        extrinsics_cpu = extrinsics.detach().cpu().float()  # world-to-cam (S, 3, 4)
         conf = predictions["depth_conf"].detach().cpu().float()
         depth = predictions["depth"].detach().cpu().float()
+
+        world_points_cpu: Optional[Tensor] = None
+        world_points_conf_cpu: Optional[Tensor] = None
+        if "world_points" in predictions and torch.is_tensor(predictions["world_points"]):
+            wp = predictions["world_points"]
+            world_points_cpu = (wp.squeeze(0) if wp.ndim == 5 else wp).detach().cpu().float()
+        if "world_points_conf" in predictions and torch.is_tensor(predictions["world_points_conf"]):
+            wpc = predictions["world_points_conf"]
+            world_points_conf_cpu = (wpc.squeeze(0) if wpc.ndim == 4 else wpc).detach().cpu().float()
 
         del predictions
         try:
@@ -541,7 +581,7 @@ class RobustVGGTExperiment:
             pass
         safe_empty_cache()
 
-        return result, depth, conf, intrinsics_cpu, rejected_image_indices
+        return result, depth, conf, intrinsics_cpu, extrinsics_cpu, world_points_cpu, world_points_conf_cpu, rejected_image_indices
 
     def _save_ply(
         self,
@@ -550,93 +590,80 @@ class RobustVGGTExperiment:
         depth: Tensor,
         conf: Tensor,
         intrinsics: Tensor,
-        twc: Tensor,
-        image_hw: tuple[int, int],
-        conf_threshold: float = 0.5,
+        extrinsics: Tensor,
+        world_points: Optional[Tensor],
+        world_points_conf: Optional[Tensor],
+        conf_threshold_pct: float = 50.0,
     ) -> None:
-        """Unproject depth maps into a colored point cloud and write a PLY file.
+        """Build a coloured point cloud and write it as a binary PLY file.
 
-        All inputs must be pre-aligned: images, depth, conf, intrinsics, and twc
-        should all have the same number of frames (survivors only).
+        Supports two point sources (controlled by self.config.use_point_map):
+          • point-map branch (default, use_point_map=True): uses world_points
+            predicted directly by the point head — highest quality, no pose error.
+          • depth branch (use_point_map=False): unprojects depth maps using the
+            decoded camera extrinsics / intrinsics via unproject_depth_map_to_point_map.
+        Confidence filtering is percentile-based so it is scale-independent.
+        All inputs must be pre-aligned to the same set of survivor frames.
         """
-        H, W = image_hw
-        # Remove trailing singleton dim: (..., 1) -> (...)
-        if depth.shape[-1] == 1:
-            depth = depth.squeeze(-1)
-        if conf.shape[-1] == 1:
-            conf = conf.squeeze(-1)
-        # Remove batch dim: (1, N, H, W) -> (N, H, W)
-        if depth.ndim == 4:
-            depth = depth.squeeze(0)
-        if conf.ndim == 4:
-            conf = conf.squeeze(0)
-        # images: (N, C, H, W) or (1, N, C, H, W)
-        if images.ndim == 5:
-            images = images.squeeze(0)
-        images_cpu = images.detach().cpu().float()
+        # ── Convert tensors to numpy, normalise batch/channel dims ───────────
+        # depth: (B, S, H, W, 1) or (S, H, W, 1) → numpy (S, H, W, 1)
+        depth_np = depth.float().cpu().numpy()
+        if depth_np.ndim == 5:
+            depth_np = depth_np.squeeze(0)
 
-        N = depth.shape[0]
+        # conf: (B, S, H, W) or (S, H, W) → numpy (S, H, W)
+        conf_np = conf.float().cpu().numpy()
+        if conf_np.ndim == 4:
+            conf_np = conf_np.squeeze(0)
 
-        # Build pixel grid once
-        v, u = torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing="ij")
+        # extrinsics: world-to-cam (S, 3, 4)
+        ext_np = extrinsics.float().cpu().numpy()
+        # intrinsics: (S, 3, 3)
+        int_np = intrinsics.float().cpu().numpy()
 
-        all_points = []
-        all_colors = []
+        # images: (1, S, C, H, W) or (S, C, H, W) → (S, H, W, 3)
+        images_np = images.float().cpu()
+        if images_np.ndim == 5:
+            images_np = images_np.squeeze(0)
+        images_np = images_np.permute(0, 2, 3, 1).numpy()  # (S, H, W, 3)
 
-        for idx in range(N):
-            d = depth[idx]  # (H, W)
-            c = conf[idx]   # (H, W)
-            K = intrinsics[idx]  # (3, 3)
-            T = twc[idx]         # (4, 4)
+        # ── Choose point source ───────────────────────────────────────────────
+        if self.config.use_point_map and world_points is not None:
+            info_print("[INFO] PLY: using point-map branch (world_points)")
+            pts_np = world_points.float().cpu().numpy()     # (S, H, W, 3)
+            if pts_np.ndim == 5:
+                pts_np = pts_np.squeeze(0)
+            pts_conf_np = (
+                world_points_conf.float().cpu().numpy()
+                if world_points_conf is not None
+                else np.ones(pts_np.shape[:3], dtype=np.float32)
+            )
+            if pts_conf_np.ndim == 4:
+                pts_conf_np = pts_conf_np.squeeze(0)
+        else:
+            info_print("[INFO] PLY: unprojecting depth maps with decoded camera parameters")
+            pts_np      = unproject_depth_map_to_point_map(depth_np, ext_np, int_np)  # (S, H, W, 3)
+            pts_conf_np = conf_np   # (S, H, W)
 
-            mask = (c > conf_threshold) & (d > 0)
+        # ── Flatten ───────────────────────────────────────────────────────────
+        points_flat = pts_np.reshape(-1, 3)                                            # (N, 3)
+        colors_flat = (images_np.reshape(-1, 3) * 255).clip(0, 255).astype(np.uint8)  # (N, 3)
+        conf_flat   = pts_conf_np.reshape(-1)                                          # (N,)
 
-            fx, fy = K[0, 0], K[1, 1]
-            cx, cy = K[0, 2], K[1, 2]
+        # ── Percentile-based confidence filtering ─────────────────────────────
+        threshold_val = np.percentile(conf_flat, conf_threshold_pct) if conf_threshold_pct > 0.0 else 0.0
+        mask = (conf_flat >= threshold_val) & (conf_flat > 1e-5)
+        info_print(
+            f"[INFO] Confidence threshold = {threshold_val:.5f} "
+            f"(bottom {conf_threshold_pct:.1f}% discarded)"
+        )
+        info_print(f"[INFO] Points after filtering: {mask.sum():,} / {len(mask):,}")
 
-            z = d[mask]
-            x = (u[mask] - cx) * z / fx
-            y = (v[mask] - cy) * z / fy
-
-            pts_cam = torch.stack([x, y, z], dim=-1)  # (M, 3)
-            ones = torch.ones(pts_cam.shape[0], 1)
-            pts_hom = torch.cat([pts_cam, ones], dim=-1)  # (M, 4)
-            pts_world = (T @ pts_hom.T).T[:, :3]  # (M, 3)
-
-            img = images_cpu[idx].permute(1, 2, 0)  # (H, W, 3)
-            colors = img[mask]  # (M, 3)
-            colors = (colors.clamp(0.0, 1.0) * 255).to(torch.uint8)
-
-            all_points.append(pts_world)
-            all_colors.append(colors)
-
-        if not all_points:
-            info_print("[WARN] No points survived filtering; PLY not written.")
+        if not mask.any():
+            info_print("[WARN] No points survived confidence filtering; PLY not written.")
             return
 
-        all_points = torch.cat(all_points, dim=0).numpy()
-        all_colors = torch.cat(all_colors, dim=0).numpy()
-
-        num_pts = all_points.shape[0]
-        info_print(f"[INFO] Writing {num_pts} points to PLY")
-
-        with open(ply_path, "wb") as f:
-            header = (
-                "ply\n"
-                "format binary_little_endian 1.0\n"
-                f"element vertex {num_pts}\n"
-                "property float x\n"
-                "property float y\n"
-                "property float z\n"
-                "property uchar red\n"
-                "property uchar green\n"
-                "property uchar blue\n"
-                "end_header\n"
-            )
-            f.write(header.encode("ascii"))
-            for i in range(num_pts):
-                f.write(struct.pack("<fff", *all_points[i]))
-                f.write(struct.pack("BBB", *all_colors[i]))
+        save_ply(str(ply_path), points_flat[mask], colors_flat[mask])
 
     def run_demo(self) -> None:
         self.pair_out_dir = Path(self.config.exp_name)
@@ -665,9 +692,11 @@ class RobustVGGTExperiment:
 
         image_hw = (int(images_tensor.shape[-2]), int(images_tensor.shape[-1]))
         
-        pred_twcs, depth, conf, intrinsics, rejected_indices = self._forward_once(images_tensor, image_hw, torch.device(self.device))
+        pred_twcs, depth, conf, intrinsics, extrinsics, world_points, world_points_conf, rejected_indices = \
+            self._forward_once(images_tensor, image_hw, torch.device(self.device))
 
         # Subset images to match survivor-only predictions
+        # (depth / extrinsics / world_points are already subsetted by _forward_once)
         if rejected_indices:
             N_total = images_tensor.shape[1] if images_tensor.ndim == 5 else images_tensor.shape[0]
             survivor_ids = [i for i in range(N_total) if i not in rejected_indices]
@@ -680,7 +709,10 @@ class RobustVGGTExperiment:
 
         # Build point cloud and save as PLY
         ply_path = self.pair_out_dir / "output.ply"
-        self._save_ply(ply_path, images_for_ply, depth, conf, intrinsics, pred_twcs, image_hw)
+        self._save_ply(
+            ply_path, images_for_ply, depth, conf, intrinsics, extrinsics,
+            world_points, world_points_conf, self.config.conf_threshold_pct,
+        )
         info_print(f"[INFO] Saved PLY to {ply_path}")
 
 
@@ -702,6 +734,14 @@ def parse_args() -> ExperimentConfig:
     parser.add_argument("--attn_a", type=float, default=0.5, help="Attention weight.")
     parser.add_argument("--cos_a", type=float, default=0.5, help="Cosine similarity weight.")
     parser.add_argument("--rej-thresh", type=float, default=0.4, help="Rejection threshold.")
+    parser.add_argument(
+        "--use-point-map", action="store_true",
+        help="Use the point-map branch instead of depth unprojection for PLY generation.",
+    )
+    parser.add_argument(
+        "--conf-threshold-pct", type=float, default=50.0,
+        help="Discard the bottom N%% of points by confidence score (0–100, default 50).",
+    )
 
     args = parser.parse_args()
 
@@ -712,6 +752,8 @@ def parse_args() -> ExperimentConfig:
         attn_a=args.attn_a,
         cos_a=args.cos_a,
         rej_thresh=args.rej_thresh,
+        use_point_map=args.use_point_map,
+        conf_threshold_pct=args.conf_threshold_pct,
     )
 
 
