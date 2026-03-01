@@ -452,8 +452,18 @@ class RobustVGGTExperiment:
             cos_sim = (cos_sim - cos_sim.min()) / (cos_sim.max() - cos_sim.min() + 1e-6)
             attn_val = (attn_val - attn_val.min()) / (attn_val.max() - attn_val.min() + 1e-6)
             
-            combined_score = self.config.attn_a * attn_val + self.config.cos_a * cos_sim 
-            
+            combined_score = self.config.attn_a * attn_val + self.config.cos_a * cos_sim
+
+            # Print per-view scores
+            info_print("[INFO] Per-view scores:")
+            for idx in range(len(combined_score)):
+                role = "anchor" if idx == 0 else f"view {idx}"
+                info_print(
+                    f"  [{role}] cos={cos_sim[idx].item():.4f}  "
+                    f"attn={attn_val[idx].item():.4f}  "
+                    f"combined={combined_score[idx].item():.4f}"
+                )
+
             # Reject
             for idx in range(len(combined_score)):
                 if idx == 0:
