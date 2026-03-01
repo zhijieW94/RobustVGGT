@@ -171,7 +171,7 @@ class RobustVGGTExperiment:
         except Exception:
             pass
 
-    def _forward_once(self, images: Tensor, image_hw: tuple[int, int], device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor, List[int]]:
+    def _forward_once(self, images: Tensor, image_hw: tuple[int, int], device: torch.device):
         import math
         import numpy as np
         import torch
@@ -271,7 +271,25 @@ class RobustVGGTExperiment:
             pass
         safe_empty_cache()
         torch.cuda.empty_cache()
-                
+
+        # Extract first-round predictions for PLY (before filtering)
+        first_pose_enc = predictions_full["pose_enc"]
+        first_ext_raw, first_int_raw = pose_encoding_to_extri_intri(first_pose_enc, image_hw)
+        first_ext_raw = first_ext_raw.squeeze(0) if first_ext_raw.ndim == 4 else first_ext_raw
+        first_int_raw = first_int_raw.squeeze(0) if first_int_raw.ndim == 4 else first_int_raw
+        first_depth = predictions_full["depth"].detach().cpu().float()
+        first_conf = predictions_full["depth_conf"].detach().cpu().float()
+        first_intrinsics_cpu = first_int_raw.detach().cpu().float()
+        first_extrinsics_cpu = first_ext_raw.detach().cpu().float()
+        first_world_points_cpu: Optional[Tensor] = None
+        first_world_points_conf_cpu: Optional[Tensor] = None
+        if "world_points" in predictions_full and torch.is_tensor(predictions_full["world_points"]):
+            wp = predictions_full["world_points"]
+            first_world_points_cpu = (wp.squeeze(0) if wp.ndim == 5 else wp).detach().cpu().float()
+        if "world_points_conf" in predictions_full and torch.is_tensor(predictions_full["world_points_conf"]):
+            wpc = predictions_full["world_points_conf"]
+            first_world_points_conf_cpu = (wpc.squeeze(0) if wpc.ndim == 4 else wpc).detach().cpu().float()
+
         global_mean_vals = []
         for h in handles:
             try:
@@ -581,7 +599,12 @@ class RobustVGGTExperiment:
             pass
         safe_empty_cache()
 
-        return result, depth, conf, intrinsics_cpu, extrinsics_cpu, world_points_cpu, world_points_conf_cpu, rejected_image_indices
+        return (
+            result, depth, conf, intrinsics_cpu, extrinsics_cpu,
+            world_points_cpu, world_points_conf_cpu, rejected_image_indices,
+            first_depth, first_conf, first_intrinsics_cpu, first_extrinsics_cpu,
+            first_world_points_cpu, first_world_points_conf_cpu,
+        )
 
     def _save_ply(
         self,
@@ -692,8 +715,22 @@ class RobustVGGTExperiment:
 
         image_hw = (int(images_tensor.shape[-2]), int(images_tensor.shape[-1]))
         
-        pred_twcs, depth, conf, intrinsics, extrinsics, world_points, world_points_conf, rejected_indices = \
-            self._forward_once(images_tensor, image_hw, torch.device(self.device))
+        (
+            pred_twcs, depth, conf, intrinsics, extrinsics,
+            world_points, world_points_conf, rejected_indices,
+            first_depth, first_conf, first_intrinsics, first_extrinsics,
+            first_world_points, first_world_points_conf,
+        ) = self._forward_once(images_tensor, image_hw, torch.device(self.device))
+
+        # Save first-round PLY (before filtering, all images)
+        ply_before = self.pair_out_dir / "before_filtering.ply"
+        self._save_ply(
+            ply_before, images_tensor, first_depth, first_conf,
+            first_intrinsics, first_extrinsics,
+            first_world_points, first_world_points_conf,
+            self.config.conf_threshold_pct,
+        )
+        info_print(f"[INFO] Saved PLY to {ply_before}")
 
         # Subset images to match survivor-only predictions
         # (depth / extrinsics / world_points are already subsetted by _forward_once)
@@ -707,13 +744,13 @@ class RobustVGGTExperiment:
         else:
             images_for_ply = images_tensor
 
-        # Build point cloud and save as PLY
-        ply_path = self.pair_out_dir / "output.ply"
+        # Save second-round PLY (after filtering, survivor images only)
+        ply_after = self.pair_out_dir / "after_filtering.ply"
         self._save_ply(
-            ply_path, images_for_ply, depth, conf, intrinsics, extrinsics,
+            ply_after, images_for_ply, depth, conf, intrinsics, extrinsics,
             world_points, world_points_conf, self.config.conf_threshold_pct,
         )
-        info_print(f"[INFO] Saved PLY to {ply_path}")
+        info_print(f"[INFO] Saved PLY to {ply_after}")
 
 
 def parse_args() -> ExperimentConfig:
