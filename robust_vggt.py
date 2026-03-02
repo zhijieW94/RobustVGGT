@@ -171,7 +171,7 @@ class RobustVGGTExperiment:
         except Exception:
             pass
 
-    def _forward_once(self, images: Tensor, image_hw: tuple[int, int], device: torch.device):
+    def _forward_once(self, images: Tensor, image_hw: tuple[int, int], device: torch.device, image_paths: Optional[List[Path]] = None):
         import math
         import numpy as np
         import torch
@@ -332,26 +332,22 @@ class RobustVGGTExperiment:
         w_patches = W // patch_size
         num_patch_tokens = h_patches * w_patches
         tokens_per_image = patch_start_idx + num_patch_tokens
-        
-        global_norms_list=[]
 
         avg_maps2d_sum = [torch.zeros((h_patches, w_patches), dtype=torch.float32) for _ in range(num_vis)]
         avg_counts = [0 for _ in range(num_vis)]
         reject_flags = [False] * num_vis
-        image_attention_means = [float("nan")] * num_vis
         global_norm_means = [float("nan")] * num_vis
-        rejection_threshold = self.config.rej_thresh
 
         first_image_patch_start = patch_start_idx
         first_image_patch_end = first_image_patch_start + num_patch_tokens
 
         for i in tqdm(attn_layers):
-            global_norms_list=[]
             if i not in q_out or i not in k_out:
                 continue
 
             Q = q_out[i]
             K = k_out[i]
+            info_print(f"[INFO] Layer {i}: q_out size={list(Q.shape)}, k_out size={list(K.shape)}")
 
             T = int(K.shape[-2])
             num_images_in_seq = T // tokens_per_image
@@ -435,7 +431,6 @@ class RobustVGGTExperiment:
                 global_mean_val = float(global_norm.mean())
                 global_mean_vals.append(global_mean_val)
                 global_norm_means[img_idx] = global_mean_val
-                global_norms_list.append(global_norm)
        
             free_cuda(Q, K, q_first_image, K_slice, logits, probs, attn_first_image)
             del Q, K, q_first_image, K_slice, logits, probs, attn_first_image
@@ -471,7 +466,14 @@ class RobustVGGTExperiment:
                 if combined_score[idx] < self.config.rej_thresh:
                     reject_flags[idx] = True
             info_print(f"[INFO] Rejection threshold: {self.config.rej_thresh:.4f}")
-        
+
+            # Print keep/drop status per image
+            info_print("[INFO] Keep/Drop per image:")
+            for idx in range(len(reject_flags)):
+                status = "KEEP" if not reject_flags[idx] else "DROP"
+                path_str = str(image_paths[idx]) if image_paths and idx < len(image_paths) else f"image_{idx}"
+                info_print(f"  [{status}] {path_str}")
+
         rejected_image_indices = [idx for idx, flag in enumerate(reject_flags) if flag and idx != 0]
         info_print(f"[INFO] Integrated rejection: {rejected_image_indices}")
 
@@ -738,7 +740,7 @@ class RobustVGGTExperiment:
             world_points, world_points_conf, rejected_indices,
             first_depth, first_conf, first_intrinsics, first_extrinsics,
             first_world_points, first_world_points_conf,
-        ) = self._forward_once(images_tensor, image_hw, torch.device(self.device))
+        ) = self._forward_once(images_tensor, image_hw, torch.device(self.device), image_paths=image_paths)
 
         # Save first-round PLY (before filtering, all images)
         ply_before = self.pair_out_dir / "before_filtering.ply"
