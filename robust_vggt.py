@@ -254,6 +254,9 @@ class RobustVGGTExperiment:
             ref_feat_norm = F.normalize(ref_feat, p=2, dim=-1)  # (1, T, C)
             layer_feat_norm = F.normalize(layer_feat, p=2, dim=-1)  # (B*N, T, C)
             cos_sim = torch.einsum("bic,bjc->bij", layer_feat_norm, ref_feat_norm)  # (B*N, T, T)
+            
+            cos_sim = ((cos_sim + 1.0) / 2.0).clamp(0.0, 1.0)  # Normalize to [0, 1]
+            
             cos_sim_mean = cos_sim.mean(-1).mean(-1)  # (B*N,)
             cosine_similarities.append(cos_sim_mean)  # List of (N,)
         
