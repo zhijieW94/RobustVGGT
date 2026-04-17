@@ -539,7 +539,7 @@ class RobustVGGTExperiment:
 
                 # Save the survivor images used for the second forward pass
                 try:
-                    survived_dir = self.pair_out_dir / "survived_images"
+                    survived_dir = self.pair_out_dir / "clean_images"
                     survived_dir.mkdir(parents=True, exist_ok=True)
                     survivors_vis = images_subset_cpu.detach().cpu().float()
                     if survivors_vis.ndim == 5:
