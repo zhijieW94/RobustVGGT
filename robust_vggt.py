@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import struct
 import sys
 import time
@@ -537,19 +538,25 @@ class RobustVGGTExperiment:
                 else:
                     raise ValueError(f"Unsupported images shape: {images.shape}")
 
-                # Save the survivor images used for the second forward pass
+                # Save the survivor images (originals, preserving filenames) used for the second forward pass
                 try:
                     survived_dir = self.pair_out_dir / "clean_images"
                     survived_dir.mkdir(parents=True, exist_ok=True)
-                    survivors_vis = images_subset_cpu.detach().cpu().float()
-                    if survivors_vis.ndim == 5:
-                        survivors_vis = survivors_vis[0]  # (N, C, H, W)
-                    for save_idx, orig_idx in enumerate(survivors):
-                        img_np = survivors_vis[save_idx].permute(1, 2, 0).numpy()
-                        img_np = np.clip(img_np, 0.0, 1.0)
-                        img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
-                        img_pil.save(survived_dir / f"survived_{orig_idx:04d}.png")
-                    info_print(f"[INFO] Saved {len(survivors)} second-round input images to {survived_dir}")
+                    if image_paths is not None:
+                        for orig_idx in survivors:
+                            src_path = Path(image_paths[orig_idx])
+                            shutil.copy2(src_path, survived_dir / src_path.name)
+                        info_print(f"[INFO] Saved {len(survivors)} second-round input images to {survived_dir}")
+                    else:
+                        survivors_vis = images_subset_cpu.detach().cpu().float()
+                        if survivors_vis.ndim == 5:
+                            survivors_vis = survivors_vis[0]  # (N, C, H, W)
+                        for save_idx, orig_idx in enumerate(survivors):
+                            img_np = survivors_vis[save_idx].permute(1, 2, 0).numpy()
+                            img_np = np.clip(img_np, 0.0, 1.0)
+                            img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
+                            img_pil.save(survived_dir / f"survived_{orig_idx:04d}.png")
+                        info_print(f"[INFO] Saved {len(survivors)} second-round input images to {survived_dir}")
                 except Exception as _e:
                     print(f"[WARN] Failed to save second-round images: {_e}")
 
