@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 DEFAULT_DATASET_ROOT = Path(
-    "/home/zhijiewu/Documents/Share/Datasets/BAT3R/scannetpp_short_50"
+    "/home/zhijiewu/Documents/Share/Datasets/MACV/evaluations/clean/scannetpp_50"
 )
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")

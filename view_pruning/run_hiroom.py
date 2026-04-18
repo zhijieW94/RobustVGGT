@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 DEFAULT_DATASET_ROOT = Path(
-    "/home/zhijiewu/Documents/Share/Datasets/BAT3R/hiroom/data/20241230"
+    "/home/zhijiewu/Documents/Share/Datasets/MACV/evaluations/clean/hiroom/data/20241230"
 )
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")

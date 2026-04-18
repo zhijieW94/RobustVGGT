@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 DEFAULT_DATASET_ROOT = Path(
-    "/home/zhijiewu/Documents/Share/Datasets/BAT3R/eth3d"
+    "/home/zhijiewu/Documents/Share/Datasets/MACV/evaluations/clean/eth3d"
 )
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")
