@@ -63,6 +63,12 @@ def _warn_print(msg: str) -> None:
     print(f"\033[93m{msg}\033[0m", flush=True)
 
 
+def _status_print(tag_prefix: str, idx: int, total: int, status: str, tag: str) -> None:
+    """Print per-run status where DONE is green and FAIL is red."""
+    color = "\033[92m" if status == "DONE" else "\033[91m"
+    print(f"{tag_prefix} [{idx}/{total}] {color}{status}\033[0m {tag}", flush=True)
+
+
 def find_image_dir(seq_dir: Path) -> Optional[Path]:
     """Return ``<seq_dir>/images`` if it contains at least one image file."""
     candidate = seq_dir / "images"
@@ -291,7 +297,9 @@ def _gpu_worker_entry(
         reconfigure(experiment, image_dir, str(out_dir))
         try:
             experiment.run_demo()
+            _status_print(tag_prefix, idx, total, "DONE", tag)
         except Exception as e:
+            _status_print(tag_prefix, idx, total, "FAIL", tag)
             tb = traceback.format_exc()
             _warn_print(f"{tag_prefix} [ERROR] {tag} failed: {e}\n{tb}")
             failures.append((noise_level, dataset, seq_name, str(e)))
@@ -500,7 +508,9 @@ def _run_method_single_process(
         reconfigure(experiment, image_dir, str(out_dir))
         try:
             experiment.run_demo()
+            _status_print(tag_prefix, idx, total, "DONE", tag)
         except Exception as e:
+            _status_print(tag_prefix, idx, total, "FAIL", tag)
             tb = traceback.format_exc()
             _warn_print(f"{tag_prefix} [ERROR] {tag} failed: {e}\n{tb}")
             failures.append((noise_level, dataset, seq_name, str(e)))
