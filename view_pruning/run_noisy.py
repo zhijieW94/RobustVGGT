@@ -354,6 +354,13 @@ def _gpu_worker_entry(
         tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
         log_path = out_dir / "run.log"
 
+        if (out_dir / "clean_images").is_dir():
+            _locked_print(
+                print_lock,
+                f"[{global_idx}/{total_runs}] SKIP  {tag}  (gpu={gpu_id}, clean_images/ exists)",
+            )
+            continue
+
         if args.skip_existing and (out_dir / sentinel_name).exists():
             _locked_print(
                 print_lock,
@@ -593,6 +600,13 @@ def _run_method_single_process(
         out_dir = args.output_root / method / noise_level / dataset / seq_name
         tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
         log_path = out_dir / "run.log"
+
+        if (out_dir / "clean_images").is_dir():
+            print(
+                f"[{global_idx}/{total_runs}] SKIP  {tag}  (cpu, clean_images/ exists)",
+                flush=True,
+            )
+            continue
 
         if args.skip_existing and (out_dir / sentinel_name).exists():
             print(f"[{global_idx}/{total_runs}] SKIP  {tag}  (cpu, already done)", flush=True)
