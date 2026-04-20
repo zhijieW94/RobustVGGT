@@ -236,13 +236,19 @@ Job = Tuple[str, str, str, str]  # (noise_level, dataset, seq_name, image_dir_st
 def _pin_to_gpu(gpu_id: int) -> None:
     """Restrict the current process to a single AMD GPU.
 
-    Must be called BEFORE importing torch. Sets both HIP and CUDA visibility
-    vars (PyTorch+ROCm respects both) plus ROCR-level visibility for safety.
+    Must be called BEFORE importing torch. Sets HIP and CUDA visibility vars
+    (PyTorch+ROCm respects both).
+
+    NOTE: do NOT also set ROCR_VISIBLE_DEVICES. ROCR filters at the ROCr
+    runtime level and renumbers devices before HIP sees them; stacking it
+    with HIP_VISIBLE_DEVICES to the same physical index makes every worker
+    except GPU0 see zero devices (the HIP index refers to a position that
+    no longer exists after ROCr already filtered down to one GPU).
     """
     val = str(gpu_id)
     os.environ["HIP_VISIBLE_DEVICES"] = val
     os.environ["CUDA_VISIBLE_DEVICES"] = val
-    os.environ["ROCR_VISIBLE_DEVICES"] = val
+    os.environ.pop("ROCR_VISIBLE_DEVICES", None)
 
 
 def _gpu_worker_entry(
@@ -260,14 +266,33 @@ def _gpu_worker_entry(
     """
     _pin_to_gpu(gpu_id)
 
+    # Force line-buffered stdout/stderr so child output streams to the terminal
+    # in real time instead of sitting in a block buffer.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+
     args = argparse.Namespace(**args_dict)
     output_root = Path(output_root_str)
     tag_prefix = f"[GPU{gpu_id}|{method}]"
     sentinel_name = _sentinel_output_filename(method)
 
+    _info_print(f"{tag_prefix} worker online (pid={os.getpid()}, HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES')}).")
+
     try:
         ExperimentCls, base_config, reconfigure, cleanup = METHOD_BUILDERS[method](args)
         experiment = ExperimentCls(base_config)
+        try:
+            import torch
+            dev_count = torch.cuda.device_count()
+            dev_name = torch.cuda.get_device_name(0) if dev_count > 0 else "<none>"
+            _info_print(
+                f"{tag_prefix} torch sees {dev_count} device(s); cuda:0 -> {dev_name}"
+            )
+        except Exception as diag_err:
+            _warn_print(f"{tag_prefix} device diag failed: {diag_err}")
     except Exception as e:
         tb = traceback.format_exc()
         _warn_print(f"{tag_prefix} [FATAL] Model load failed: {e}\n{tb}")
