@@ -31,11 +31,13 @@ External repo roots for Pi3 / MapAnything can be overridden via the
 from __future__ import annotations
 
 import argparse
+import contextlib
 import multiprocessing as mp
 import os
 import re
 import subprocess
 import sys
+import time
 import traceback
 from dataclasses import replace
 from pathlib import Path
@@ -63,10 +65,49 @@ def _warn_print(msg: str) -> None:
     print(f"\033[93m{msg}\033[0m", flush=True)
 
 
-def _status_print(tag_prefix: str, idx: int, total: int, status: str, tag: str) -> None:
-    """Print per-run status where DONE is green and FAIL is red."""
-    color = "\033[92m" if status == "DONE" else "\033[91m"
-    print(f"{tag_prefix} [{idx}/{total}] {color}{status}\033[0m {tag}", flush=True)
+_ANSI_GREEN = "\033[32m"
+_ANSI_RED = "\033[31m"
+_ANSI_RESET = "\033[0m"
+_USE_ANSI_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _color_status(status: str) -> str:
+    if not _USE_ANSI_COLOR:
+        return status
+    if status == "DONE":
+        return f"{_ANSI_GREEN}{status}{_ANSI_RESET}"
+    if status == "FAIL":
+        return f"{_ANSI_RED}{status}{_ANSI_RESET}"
+    return status
+
+
+@contextlib.contextmanager
+def _redirect_fd_to_file(log_path: Path):
+    """Redirect fd 1 (stdout) and fd 2 (stderr) to ``log_path`` for the block.
+
+    Uses ``os.dup2`` so the redirect also captures C-level output (e.g. HF
+    Hub warnings, CUDA/HIP runtime messages) — not just Python ``print``.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    f = open(log_path, "ab", buffering=0)
+    try:
+        os.dup2(f.fileno(), 1)
+        os.dup2(f.fileno(), 2)
+        try:
+            yield
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved_stdout, 1)
+            os.dup2(saved_stderr, 2)
+    finally:
+        f.close()
+        os.close(saved_stdout)
+        os.close(saved_stderr)
 
 
 def find_image_dir(seq_dir: Path) -> Optional[Path]:
@@ -251,23 +292,36 @@ def _pin_to_gpu(gpu_id: int) -> None:
     os.environ.pop("ROCR_VISIBLE_DEVICES", None)
 
 
+IndexedJob = Tuple[int, str, str, str, str]  # (global_idx, noise, dataset, seq, image_dir)
+
+
+def _locked_print(lock, msg: str) -> None:
+    """Print ``msg`` while holding ``lock`` (no-op-safe if lock is None)."""
+    if lock is None:
+        print(msg, flush=True)
+        return
+    with lock:
+        print(msg, flush=True)
+
+
 def _gpu_worker_entry(
     gpu_id: int,
     method: str,
     args_dict: dict,
-    jobs: List[Job],
+    jobs: List[IndexedJob],
     output_root_str: str,
+    total_runs: int,
+    print_lock,
     result_queue: mp.Queue,
 ) -> None:
     """Entry point for a per-GPU subprocess.
 
-    Loads the method's model once, then runs every assigned (noise_level,
-    dataset, seq) job on that single GPU.
+    Loads the method's model once, then runs every assigned job on that
+    single GPU. Each job's stdout/stderr are redirected to ``<out_dir>/run.log``
+    so the master terminal only shows concise START/DONE/FAIL status lines.
     """
     _pin_to_gpu(gpu_id)
 
-    # Force line-buffered stdout/stderr so child output streams to the terminal
-    # in real time instead of sitting in a block buffer.
     try:
         sys.stdout.reconfigure(line_buffering=True)
         sys.stderr.reconfigure(line_buffering=True)
@@ -276,57 +330,67 @@ def _gpu_worker_entry(
 
     args = argparse.Namespace(**args_dict)
     output_root = Path(output_root_str)
-    tag_prefix = f"[GPU{gpu_id}|{method}]"
     sentinel_name = _sentinel_output_filename(method)
-
-    _info_print(f"{tag_prefix} worker online (pid={os.getpid()}, HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES')}).")
 
     try:
         ExperimentCls, base_config, reconfigure, cleanup = METHOD_BUILDERS[method](args)
         experiment = ExperimentCls(base_config)
-        try:
-            import torch
-            dev_count = torch.cuda.device_count()
-            dev_name = torch.cuda.get_device_name(0) if dev_count > 0 else "<none>"
-            _info_print(
-                f"{tag_prefix} torch sees {dev_count} device(s); cuda:0 -> {dev_name}"
-            )
-        except Exception as diag_err:
-            _warn_print(f"{tag_prefix} device diag failed: {diag_err}")
     except Exception as e:
         tb = traceback.format_exc()
-        _warn_print(f"{tag_prefix} [FATAL] Model load failed: {e}\n{tb}")
+        _locked_print(
+            print_lock,
+            f"\033[93m[FATAL] {method} model load on gpu={gpu_id} failed: {e}\n{tb}\033[0m",
+        )
         result_queue.put(
             [(noise_level, dataset, seq_name, f"model-load failure: {e}")
-             for noise_level, dataset, seq_name, _ in jobs]
+             for _, noise_level, dataset, seq_name, _ in jobs]
         )
         return
 
     failures: List[Tuple[str, str, str, str]] = []
-    total = len(jobs)
-    for idx, (noise_level, dataset, seq_name, image_dir_str) in enumerate(jobs, start=1):
+    for global_idx, noise_level, dataset, seq_name, image_dir_str in jobs:
         image_dir = Path(image_dir_str)
         out_dir = output_root / method / noise_level / dataset / seq_name
-        tag = f"{noise_level}/{dataset}/{seq_name}"
+        tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
+        log_path = out_dir / "run.log"
 
         if args.skip_existing and (out_dir / sentinel_name).exists():
-            _info_print(f"{tag_prefix} [{idx}/{total}] Skipping {tag} (already done).")
+            _locked_print(
+                print_lock,
+                f"[{global_idx}/{total_runs}] SKIP  {tag}  (gpu={gpu_id}, already done)",
+            )
             continue
 
-        _info_print(
-            f"{tag_prefix} [{idx}/{total}] === {tag} ===\n"
-            f"    images: {image_dir}\n"
-            f"    output: {out_dir}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _locked_print(
+            print_lock,
+            f"[{global_idx}/{total_runs}] START {tag}  (gpu={gpu_id})  log={log_path}",
         )
 
         reconfigure(experiment, image_dir, str(out_dir))
+        start = time.time()
         try:
-            experiment.run_demo()
-            _status_print(tag_prefix, idx, total, "DONE", tag)
+            with _redirect_fd_to_file(log_path):
+                experiment.run_demo()
+            dur = time.time() - start
+            _locked_print(
+                print_lock,
+                f"[{global_idx}/{total_runs}] {_color_status('DONE')}  {tag}  "
+                f"(gpu={gpu_id}, {dur:.1f}s)",
+            )
         except Exception as e:
-            _status_print(tag_prefix, idx, total, "FAIL", tag)
+            dur = time.time() - start
             tb = traceback.format_exc()
-            _warn_print(f"{tag_prefix} [ERROR] {tag} failed: {e}\n{tb}")
+            try:
+                with open(log_path, "a") as lf:
+                    lf.write(f"\n# run_demo raised: {e}\n{tb}\n")
+            except Exception:
+                pass
+            _locked_print(
+                print_lock,
+                f"[{global_idx}/{total_runs}] {_color_status('FAIL')}  {tag}  "
+                f"(gpu={gpu_id}, {dur:.1f}s)  see {log_path}",
+            )
             failures.append((noise_level, dataset, seq_name, str(e)))
         finally:
             cleanup()
@@ -491,9 +555,9 @@ def _resolve_gpus(args: argparse.Namespace) -> List[int]:
     return free
 
 
-def _round_robin_split(jobs: List[Job], n: int) -> List[List[Job]]:
+def _round_robin_split(jobs: List[IndexedJob], n: int) -> List[List[IndexedJob]]:
     """Split ``jobs`` into ``n`` round-robin chunks to balance length bias."""
-    chunks: List[List[Job]] = [[] for _ in range(n)]
+    chunks: List[List[IndexedJob]] = [[] for _ in range(n)]
     for i, job in enumerate(jobs):
         chunks[i % n].append(job)
     return chunks
@@ -503,41 +567,65 @@ def _round_robin_split(jobs: List[Job], n: int) -> List[List[Job]]:
 # Main
 # ---------------------------------------------------------------------------
 
+def _index_jobs(jobs: List[Job], method_offset: int) -> List[IndexedJob]:
+    """Attach a 1-based global index to each job, starting at ``method_offset + 1``."""
+    return [
+        (method_offset + i + 1, noise, dataset, seq, img)
+        for i, (noise, dataset, seq, img) in enumerate(jobs)
+    ]
+
+
 def _run_method_single_process(
     method: str,
     args: argparse.Namespace,
     jobs: List[Job],
+    method_offset: int,
+    total_runs: int,
 ) -> List[Tuple[str, str, str, str]]:
-    """Legacy single-process path when no GPUs are pinned."""
-    tag_prefix = f"[single|{method}]"
+    """Single-process path when no GPUs are pinned. Matches multi-GPU output format."""
     sentinel_name = _sentinel_output_filename(method)
     ExperimentCls, base_config, reconfigure, cleanup = METHOD_BUILDERS[method](args)
     experiment = ExperimentCls(base_config)
 
     failures: List[Tuple[str, str, str, str]] = []
-    total = len(jobs)
-    for idx, (noise_level, dataset, seq_name, image_dir_str) in enumerate(jobs, start=1):
+    for global_idx, noise_level, dataset, seq_name, image_dir_str in _index_jobs(jobs, method_offset):
         image_dir = Path(image_dir_str)
         out_dir = args.output_root / method / noise_level / dataset / seq_name
-        tag = f"{noise_level}/{dataset}/{seq_name}"
+        tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
+        log_path = out_dir / "run.log"
 
         if args.skip_existing and (out_dir / sentinel_name).exists():
-            _info_print(f"{tag_prefix} [{idx}/{total}] Skipping {tag} (already done).")
+            print(f"[{global_idx}/{total_runs}] SKIP  {tag}  (cpu, already done)", flush=True)
             continue
 
-        _info_print(
-            f"{tag_prefix} [{idx}/{total}] === {tag} ===\n"
-            f"    images: {image_dir}\n"
-            f"    output: {out_dir}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[{global_idx}/{total_runs}] START {tag}  (cpu)  log={log_path}",
+            flush=True,
         )
         reconfigure(experiment, image_dir, str(out_dir))
+        start = time.time()
         try:
-            experiment.run_demo()
-            _status_print(tag_prefix, idx, total, "DONE", tag)
+            with _redirect_fd_to_file(log_path):
+                experiment.run_demo()
+            dur = time.time() - start
+            print(
+                f"[{global_idx}/{total_runs}] {_color_status('DONE')}  {tag}  (cpu, {dur:.1f}s)",
+                flush=True,
+            )
         except Exception as e:
-            _status_print(tag_prefix, idx, total, "FAIL", tag)
+            dur = time.time() - start
             tb = traceback.format_exc()
-            _warn_print(f"{tag_prefix} [ERROR] {tag} failed: {e}\n{tb}")
+            try:
+                with open(log_path, "a") as lf:
+                    lf.write(f"\n# run_demo raised: {e}\n{tb}\n")
+            except Exception:
+                pass
+            print(
+                f"[{global_idx}/{total_runs}] {_color_status('FAIL')}  {tag}  "
+                f"(cpu, {dur:.1f}s)  see {log_path}",
+                flush=True,
+            )
             failures.append((noise_level, dataset, seq_name, str(e)))
         finally:
             cleanup()
@@ -553,26 +641,25 @@ def _run_method_multi_gpu(
     jobs: List[Job],
     gpus: List[int],
     ctx: mp.context.BaseContext,
+    method_offset: int,
+    total_runs: int,
+    print_lock,
 ) -> List[Tuple[str, str, str, str]]:
     """Spawn one subprocess per GPU and round-robin the method's jobs across them."""
-    n = min(len(gpus), len(jobs))
+    indexed = _index_jobs(jobs, method_offset)
+    n = min(len(gpus), len(indexed))
     active_gpus = gpus[:n]
-    chunks = _round_robin_split(jobs, n)
+    chunks = _round_robin_split(indexed, n)
 
     result_queue: mp.Queue = ctx.Queue()
     processes: List[mp.Process] = []
     args_dict = vars(args).copy()
-    # Paths need to serialize cleanly; argparse already gives us Path objects.
-    # dict + spawn pickling handles Path fine.
 
     for gpu_id, chunk in zip(active_gpus, chunks):
-        _info_print(
-            f"[INFO] Spawning worker for method={method} on GPU{gpu_id} "
-            f"with {len(chunk)} job(s)."
-        )
         p = ctx.Process(
             target=_gpu_worker_entry,
-            args=(gpu_id, method, args_dict, chunk, str(args.output_root), result_queue),
+            args=(gpu_id, method, args_dict, chunk, str(args.output_root),
+                  total_runs, print_lock, result_queue),
             daemon=False,
         )
         p.start()
@@ -585,8 +672,9 @@ def _run_method_multi_gpu(
     for p in processes:
         p.join()
         if p.exitcode != 0:
-            _warn_print(
-                f"[WARN] Worker (pid {p.pid}) exited with code {p.exitcode}."
+            _locked_print(
+                print_lock,
+                f"\033[93m[WARN] Worker (pid {p.pid}) exited with code {p.exitcode}.\033[0m",
             )
     return failures
 
@@ -614,14 +702,21 @@ def main() -> None:
     )
 
     ctx = mp.get_context("spawn") if gpus else None
+    print_lock = ctx.Lock() if ctx is not None else None
     all_failures: List[Tuple[str, str, str, str, str]] = []
 
-    for method in args.methods:
+    for method_idx, method in enumerate(args.methods):
         _info_print(f"\n========== method={method} ==========")
+        method_offset = method_idx * len(jobs)
         if gpus:
-            method_failures = _run_method_multi_gpu(method, args, jobs, gpus, ctx)
+            method_failures = _run_method_multi_gpu(
+                method, args, jobs, gpus, ctx,
+                method_offset, total_runs, print_lock,
+            )
         else:
-            method_failures = _run_method_single_process(method, args, jobs)
+            method_failures = _run_method_single_process(
+                method, args, jobs, method_offset, total_runs,
+            )
         for noise_level, dataset, seq_name, msg in method_failures:
             all_failures.append((method, noise_level, dataset, seq_name, msg))
 
