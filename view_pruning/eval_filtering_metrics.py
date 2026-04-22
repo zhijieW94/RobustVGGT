@@ -1,7 +1,9 @@
 """Compute view-filtering classification metrics for Robust_X outputs.
 
-Ground truth: /nvmepool/zhijiewu/Datasets/Final_Benchmarks/<level>/<dataset>/<seq>/image_list.txt
-Predictions: <pred_root>/<method>/<level>/<dataset>/<seq>/clean_images/
+Ground truth: /nvmepool/zhijiewu/Datasets/Final_Benchmarks/{clean,low_noisy,mid_noisy,high_noisy}/<dataset>/<seq>/image_list.txt
+Predictions: <pred_root>/<method>/{clean,low_noisy,mid_noisy,high_noisy}/<dataset>/<seq>/clean_images/
+
+Note: For clean datasets (no distractors), DistractorRejectionRate will be NaN, but CleanKeepRate is still computed.
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ from pathlib import Path
 GT_ROOT = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks")
 
 METHODS = ["vggt", "pi3", "mapanything"]
-LEVELS = ["clean", "low", "mid", "high"]
+LEVELS = ["clean", "low_noisy", "mid_noisy", "high_noisy"]
 DATASETS = ["eth3d", "scannetpp_50", "onthego", "phototourism"]
 
 METRIC_NAMES = ["CleanKeepRate", "DistractorRejectionRate", "F1", "MCC"]

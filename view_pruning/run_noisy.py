@@ -5,7 +5,7 @@ Noisy dataset layout (unified across the datasets):
     <dataset_root>/<noise_level>/<dataset>/<seq_name>/images/*.jpg
 
 where
-    noise_level ∈ {clean, low, mid, high}
+    noise_level ∈ {clean, low_noisy, mid_noisy, high_noisy}
     dataset     ∈ {eth3d, scannetpp_50, onthego, phototourism}
 
 For each selected (method, noise_level, dataset, seq), the model is invoked
@@ -60,7 +60,7 @@ GPU_VISIBILITY_CLEAR_VARS = (
 
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")
-NOISE_LEVELS = ("clean", "low", "mid", "high")
+NOISE_LEVELS = ("clean", "low_noisy", "mid_noisy", "high_noisy")
 DATASETS = ("eth3d", "scannetpp_50", "onthego", "phototourism")
 
 
