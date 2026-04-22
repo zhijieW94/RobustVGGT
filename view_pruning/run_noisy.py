@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Batch-run robust view-pruning methods over noisy testbeds (eth3d / hiroom / scannet).
+"""Batch-run robust view-pruning methods over noisy testbeds (eth3d / scannetpp_50 / onthego / phototourism).
 
-Noisy dataset layout (unified across the three datasets):
+Noisy dataset layout (unified across the datasets):
     <dataset_root>/<noise_level>/<dataset>/<seq_name>/images/*.jpg
 
 where
-    noise_level ∈ {low_noisy, mid_noisy, high_noisy}
-    dataset     ∈ {eth3d, hiroom, scannetpp_50}
+    noise_level ∈ {clean, low, mid, high}
+    dataset     ∈ {eth3d, scannetpp_50, onthego, phototourism}
 
 For each selected (method, noise_level, dataset, seq), the model is invoked
 on ``<seq_dir>/images`` and results are written to::
@@ -48,8 +48,8 @@ REPO_ROOT = FILE_PATH.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 
-DEFAULT_DATASET_ROOT = Path("/nvmepool/zhijiewu/Datasets/MACV_testbeds/noisy")
-DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/noisy/Robust_X")
+DEFAULT_DATASET_ROOT = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks")
+DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/Robust_X")
 
 GPU_VISIBILITY_CLEAR_VARS = (
     "HIP_VISIBLE_DEVICES",
@@ -59,8 +59,8 @@ GPU_VISIBILITY_CLEAR_VARS = (
 
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")
-NOISE_LEVELS = ("low_noisy", "mid_noisy", "high_noisy")
-DATASETS = ("eth3d", "hiroom", "scannetpp_50")
+NOISE_LEVELS = ("clean", "low", "mid", "high")
+DATASETS = ("eth3d", "scannetpp_50", "onthego", "phototourism")
 
 
 def _info_print(msg: str) -> None:
