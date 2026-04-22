@@ -45,6 +45,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 FILE_PATH = Path(__file__).resolve()
 REPO_ROOT = FILE_PATH.parents[1]
+SCRIPT_DIR = FILE_PATH.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
@@ -767,6 +768,40 @@ def _report_per_dataset_metrics(
                         for i, (v, w) in enumerate(zip(row, widths))))
 
 
+def _compute_filtering_metrics(output_root: Path) -> None:
+    """Run eval_filtering_metrics.py to compute metrics after batch processing."""
+    script_path = SCRIPT_DIR / "eval_filtering_metrics.py"
+    if not script_path.is_file():
+        print(f"[warn] metrics script not found: {script_path}")
+        return
+
+    pred_root = output_root
+    metrics_dir = pred_root / "_metrics"
+
+    print()
+    print("=" * 60)
+    print("Computing filtering metrics...")
+    print(f"  Predictions root: {pred_root}")
+    print(f"  Metrics output:   {metrics_dir}")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script_path),
+             "--pred-root", str(pred_root),
+             "--out-dir", str(metrics_dir)],
+            capture_output=False,
+            timeout=3600,
+        )
+        if result.returncode == 0:
+            print("[ok] filtering metrics computed successfully")
+        else:
+            print(f"[warn] metrics computation exited with code {result.returncode}")
+    except subprocess.TimeoutExpired:
+        print("[warn] metrics computation timed out (>1 hour)")
+    except Exception as e:
+        print(f"[warn] failed to compute metrics: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -931,6 +966,8 @@ def main() -> None:
         for noise_level, dataset, seq_name, msg in method_failures:
             all_failures.append((method, noise_level, dataset, seq_name, msg))
         _report_per_dataset_metrics(method, args.noise_levels, args.datasets, args.dataset_root, args.output_root)
+
+    _compute_filtering_metrics(args.output_root)
 
     succeeded = total_runs - len(all_failures)
     _info_print(f"\n[DONE] Processed {succeeded}/{total_runs} runs successfully.")
