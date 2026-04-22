@@ -51,6 +51,12 @@ sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_DATASET_ROOT = Path("/nvmepool/zhijiewu/Datasets/MACV_testbeds/noisy")
 DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/noisy/Robust_X")
 
+GPU_VISIBILITY_CLEAR_VARS = (
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+)
+
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")
 NOISE_LEVELS = ("low_noisy", "mid_noisy", "high_noisy")
@@ -182,6 +188,23 @@ def detect_free_amd_gpus(mem_threshold_mb: float) -> List[int]:
         status = "FREE" if mb < mem_threshold_mb else "BUSY"
         _info_print(f"    GPU[{g}]: {mb:8.1f} MB used  → {status}")
     return free
+
+
+def detect_nvidia_gpus() -> List[int]:
+    """Return indices of available NVIDIA GPUs via nvidia-smi.
+
+    Fallback when rocm-smi is not available.
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return []
+    return sorted([int(line.strip()) for line in out.splitlines() if line.strip()])
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +377,7 @@ def _gpu_worker_entry(
         tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
         log_path = out_dir / "run.log"
 
-        if (out_dir / "clean_images").is_dir():
+        if not args.force and (out_dir / "clean_images").is_dir():
             _locked_print(
                 print_lock,
                 f"[{global_idx}/{total_runs}] SKIP  {tag}  (gpu={gpu_id}, clean_images/ exists)",
@@ -449,6 +472,10 @@ def parse_args() -> argparse.Namespace:
         "--skip-existing", action="store_true",
         help="Skip runs whose output directory already contains the method's "
              "main PLY file (after_filtering.ply for vggt, reconstruction.ply otherwise).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Re-run sequences even if their out_dir already has a 'clean_images/' folder.",
     )
 
     # GPU / parallelism
@@ -550,12 +577,18 @@ def _resolve_gpus(args: argparse.Namespace) -> List[int]:
     _info_print("[INFO] Auto-detecting free AMD GPUs via rocm-smi …")
     free = detect_free_amd_gpus(args.gpu_mem_threshold_mb)
     if not free:
-        _warn_print(
-            "[WARN] No free AMD GPUs detected; falling back to a single "
-            "in-process worker on the default device."
-        )
-        return []
-    _info_print(f"[INFO] Free AMD GPUs: {free}")
+        _info_print("[INFO] No AMD GPUs found; trying NVIDIA via nvidia-smi …")
+        free = detect_nvidia_gpus()
+        if free:
+            _info_print(f"[INFO] NVIDIA GPUs detected: {free}")
+        else:
+            _warn_print(
+                "[WARN] No GPUs detected; falling back to a single "
+                "in-process worker on the default device."
+            )
+            return []
+    else:
+        _info_print(f"[INFO] Free AMD GPUs: {free}")
     if args.max_workers is not None and args.max_workers > 0:
         free = free[: args.max_workers]
         _info_print(f"[INFO] Capped to --max-workers: {free}")
@@ -568,6 +601,170 @@ def _round_robin_split(jobs: List[IndexedJob], n: int) -> List[List[IndexedJob]]
     for i, job in enumerate(jobs):
         chunks[i % n].append(job)
     return chunks
+
+
+def _parse_image_list(path: Path) -> dict[str, int]:
+    """Parse ground truth image_list.txt file."""
+    labels: dict[str, int] = {}
+    if not path.is_file():
+        return labels
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            tag, _, rel = line.partition(" ")
+            name = Path(rel).name
+            if tag == "[Clean]":
+                labels[name] = 1
+            elif tag == "[Noisy]":
+                labels[name] = 0
+    return labels
+
+
+def _list_kept_images(clean_dir: Path) -> set[str]:
+    """List images in clean_images directory."""
+    if not clean_dir.is_dir():
+        return set()
+    return {p.name for p in clean_dir.iterdir() if p.is_file()}
+
+
+def _compute_confusion_matrix(labels: dict[str, int], kept: set[str]) -> tuple[int, int, int, int]:
+    """Compute TP, FN, FP, TN from labels and kept images."""
+    tp = fn = fp = tn = 0
+    for name, lab in labels.items():
+        in_kept = name in kept
+        if lab == 1 and in_kept:
+            tp += 1
+        elif lab == 1 and not in_kept:
+            fn += 1
+        elif lab == 0 and in_kept:
+            fp += 1
+        else:
+            tn += 1
+    return tp, fn, fp, tn
+
+
+def _metrics_from_cm(tp: int, fn: int, fp: int, tn: int) -> dict[str, float]:
+    """Compute metrics from confusion matrix."""
+    import math
+    clean_keep = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    distractor_rej = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+    precision_kept = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    recall = clean_keep
+    if not (math.isnan(precision_kept) or math.isnan(recall) or (precision_kept + recall) == 0):
+        f1 = 2 * precision_kept * recall / (precision_kept + recall)
+    else:
+        f1 = float("nan")
+    denom2 = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    mcc = (tp * tn - fp * fn) / math.sqrt(denom2) if denom2 > 0 else float("nan")
+    return {
+        "TP": tp, "FN": fn, "FP": fp, "TN": tn,
+        "N_clean": tp + fn, "N_noisy": fp + tn, "N_kept": tp + fp,
+        "CleanKeepRate": clean_keep,
+        "DistractorRejectionRate": distractor_rej,
+        "F1": f1,
+        "MCC": mcc,
+    }
+
+
+def _mean(xs: list[float]) -> float:
+    """Compute mean, ignoring NaNs."""
+    import math
+    xs = [x for x in xs if not math.isnan(x)]
+    return sum(xs) / len(xs) if xs else float("nan")
+
+
+def _report_per_dataset_metrics(
+    method: str,
+    noise_levels: List[str],
+    datasets: List[str],
+    dataset_root: Path,
+    output_root: Path,
+) -> None:
+    """Compute and report average metrics grouped by (noise_level, dataset)."""
+    import math
+
+    pred_root = output_root / method
+
+    per_seq_metrics: list[dict] = []
+
+    for noise in noise_levels:
+        for dataset in datasets:
+            gt_ds_dir = dataset_root / noise / dataset
+            if not gt_ds_dir.is_dir():
+                continue
+
+            for seq_dir in sorted(gt_ds_dir.iterdir()):
+                if not seq_dir.is_dir():
+                    continue
+                seq = seq_dir.name
+                gt_file = seq_dir / "image_list.txt"
+                pred_seq = pred_root / noise / dataset / seq
+                clean_dir = pred_seq / "clean_images"
+
+                if not clean_dir.is_dir():
+                    continue
+
+                labels = _parse_image_list(gt_file)
+                if not labels:
+                    continue
+                kept = _list_kept_images(clean_dir)
+                tp, fn, fp, tn = _compute_confusion_matrix(labels, kept)
+                m = _metrics_from_cm(tp, fn, fp, tn)
+                per_seq_metrics.append({
+                    "noise_level": noise,
+                    "dataset": dataset,
+                    "sequence": seq,
+                    **m,
+                })
+
+    if not per_seq_metrics:
+        return
+
+    # Group by (noise_level, dataset) and compute averages
+    buckets: dict[tuple, list[dict]] = {}
+    for r in per_seq_metrics:
+        key = (r["noise_level"], r["dataset"])
+        if key not in buckets:
+            buckets[key] = []
+        buckets[key].append(r)
+
+    print()
+    per_dataset_rows = []
+    for (noise, dataset) in sorted(buckets.keys()):
+        rows = buckets[(noise, dataset)]
+        row = {
+            "noise_level": noise,
+            "dataset": dataset,
+            "n_sequences": len(rows),
+            "CleanKeepRate": _mean([r["CleanKeepRate"] for r in rows]),
+            "DistractorRejectionRate": _mean([r["DistractorRejectionRate"] for r in rows]),
+            "F1": _mean([r["F1"] for r in rows]),
+            "MCC": _mean([r["MCC"] for r in rows]),
+        }
+        per_dataset_rows.append(row)
+
+    # Print table
+    columns = ["noise_level", "dataset", "CleanKeepRate", "DistractorRejectionRate", "F1", "MCC", "n_sequences"]
+
+    def _fmt_metric(val) -> str:
+        if isinstance(val, float):
+            return "nan" if math.isnan(val) else f"{val:.4f}"
+        return str(val)
+
+    cells = [[_fmt_metric(r[c]) for c in columns] for r in per_dataset_rows]
+    widths = [max(len(c), *(len(row[i]) for row in cells)) if cells else len(c)
+              for i, c in enumerate(columns)]
+
+    print(f"=== {method}: Per-dataset average metrics ===")
+    header = "  ".join(c.ljust(w) if i == 0 else c.rjust(w)
+                       for i, (c, w) in enumerate(zip(columns, widths)))
+    print(header)
+    print("  ".join("-" * w for w in widths))
+    for row in cells:
+        print("  ".join(v.ljust(w) if i == 0 else v.rjust(w)
+                        for i, (v, w) in enumerate(zip(row, widths))))
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +798,7 @@ def _run_method_single_process(
         tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
         log_path = out_dir / "run.log"
 
-        if (out_dir / "clean_images").is_dir():
+        if not args.force and (out_dir / "clean_images").is_dir():
             print(
                 f"[{global_idx}/{total_runs}] SKIP  {tag}  (cpu, clean_images/ exists)",
                 flush=True,
@@ -733,6 +930,7 @@ def main() -> None:
             )
         for noise_level, dataset, seq_name, msg in method_failures:
             all_failures.append((method, noise_level, dataset, seq_name, msg))
+        _report_per_dataset_metrics(method, args.noise_levels, args.datasets, args.dataset_root, args.output_root)
 
     succeeded = total_runs - len(all_failures)
     _info_print(f"\n[DONE] Processed {succeeded}/{total_runs} runs successfully.")
