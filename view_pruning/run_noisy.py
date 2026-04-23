@@ -740,25 +740,37 @@ def _report_per_dataset_metrics(
             "dataset": dataset,
             "n_sequences": len(rows),
             "CleanKeepRate": _mean([r["CleanKeepRate"] for r in rows]),
-            "DistractorRejectionRate": _mean([r["DistractorRejectionRate"] for r in rows]),
-            "F1": _mean([r["F1"] for r in rows]),
-            "MCC": _mean([r["MCC"] for r in rows]),
         }
+        if noise != "clean":
+            row["DistractorRejectionRate"] = _mean([r["DistractorRejectionRate"] for r in rows])
+            row["F1"] = _mean([r["F1"] for r in rows])
+            row["MCC"] = _mean([r["MCC"] for r in rows])
         per_dataset_rows.append(row)
 
-    # Print table
-    columns = ["noise_level", "dataset", "CleanKeepRate", "DistractorRejectionRate", "F1", "MCC", "n_sequences"]
+    # Print table (different columns for clean vs noisy)
+    has_clean = any(r["noise_level"] == "clean" for r in per_dataset_rows)
+    has_noisy = any(r["noise_level"] != "clean" for r in per_dataset_rows)
+
+    if has_clean and has_noisy:
+        print(f"=== {method}: Per-dataset average metrics ===")
+        print("(Note: 'clean' noise level shows only CleanKeepRate; noisy levels show all metrics)")
+        columns = ["noise_level", "dataset", "CleanKeepRate", "DistractorRejectionRate", "F1", "MCC", "n_sequences"]
+    elif has_clean:
+        print(f"=== {method}: Per-dataset average metrics (clean only) ===")
+        columns = ["noise_level", "dataset", "CleanKeepRate", "n_sequences"]
+    else:
+        print(f"=== {method}: Per-dataset average metrics ===")
+        columns = ["noise_level", "dataset", "CleanKeepRate", "DistractorRejectionRate", "F1", "MCC", "n_sequences"]
 
     def _fmt_metric(val) -> str:
         if isinstance(val, float):
             return "nan" if math.isnan(val) else f"{val:.4f}"
         return str(val)
 
-    cells = [[_fmt_metric(r[c]) for c in columns] for r in per_dataset_rows]
+    cells = [[_fmt_metric(r.get(c, "—")) for c in columns] for r in per_dataset_rows]
     widths = [max(len(c), *(len(row[i]) for row in cells)) if cells else len(c)
               for i, c in enumerate(columns)]
 
-    print(f"=== {method}: Per-dataset average metrics ===")
     header = "  ".join(c.ljust(w) if i == 0 else c.rjust(w)
                        for i, (c, w) in enumerate(zip(columns, widths)))
     print(header)
