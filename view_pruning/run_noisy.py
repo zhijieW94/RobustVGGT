@@ -605,7 +605,12 @@ def _round_robin_split(jobs: List[IndexedJob], n: int) -> List[List[IndexedJob]]
 
 
 def _parse_image_list(path: Path) -> dict[str, int]:
-    """Parse ground truth image_list.txt file."""
+    """Parse ground truth image_list.txt file.
+
+    Handles two formats:
+    1. Clean datasets: "1\t[Clean] images/DSC_0286.JPG"
+    2. Noisy datasets: "[Clean] images/1.jpg"
+    """
     labels: dict[str, int] = {}
     if not path.is_file():
         return labels
@@ -614,12 +619,28 @@ def _parse_image_list(path: Path) -> dict[str, int]:
             line = line.strip()
             if not line:
                 continue
-            tag, _, rel = line.partition(" ")
-            name = Path(rel).name
-            if tag == "[Clean]":
-                labels[name] = 1
-            elif tag == "[Noisy]":
-                labels[name] = 0
+            if "[Clean]" in line:
+                tokens = line.split()
+                # Find the index part after [Clean]
+                try:
+                    idx = tokens.index("[Clean]")
+                    # The path is everything after [Clean]
+                    rel = " ".join(tokens[idx+1:])
+                    name = Path(rel).name
+                    labels[name] = 1
+                except (ValueError, IndexError):
+                    pass
+            elif "[Noisy]" in line:
+                tokens = line.split()
+                # Find the index part after [Noisy]
+                try:
+                    idx = tokens.index("[Noisy]")
+                    # The path is everything after [Noisy]
+                    rel = " ".join(tokens[idx+1:])
+                    name = Path(rel).name
+                    labels[name] = 0
+                except (ValueError, IndexError):
+                    pass
     return labels
 
 
