@@ -29,6 +29,9 @@ def parse_image_list(path: Path) -> dict[str, int]:
             line = line.strip()
             if not line:
                 continue
+            # Handle optional leading number (e.g., "1\t[Clean] path" or "[Clean] path")
+            if line[0].isdigit():
+                _, _, line = line.partition("\t")
             tag, _, rel = line.partition(" ")
             name = Path(rel).name
             if tag == "[Clean]":

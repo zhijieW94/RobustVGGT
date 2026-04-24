@@ -61,7 +61,7 @@ GPU_VISIBILITY_CLEAR_VARS = (
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")
 NOISE_LEVELS = ("clean", "low_noisy", "mid_noisy", "high_noisy")
-DATASETS = ("eth3d", "scannetpp_50", "onthego", "phototourism")
+DATASETS = ("eth3d", "scannet", "onthego", "phototourism")
 
 
 def _info_print(msg: str) -> None:
