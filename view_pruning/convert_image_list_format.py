@@ -5,8 +5,11 @@ Before: 1	[Clean] images/DSC_0286.JPG
 After:  [Clean] images/DSC_0286.JPG
 """
 
+import argparse
 import sys
 from pathlib import Path
+
+DEFAULT_DATASET_ROOT = Path("/home/zhijiewu/Documents/Share/Datasets/MACV/Final_Benchmarks")
 
 
 def convert_image_list(txt_path: Path) -> tuple[int, str]:
@@ -42,17 +45,31 @@ def convert_image_list(txt_path: Path) -> tuple[int, str]:
 
 
 def main():
-    dataset_root = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks")
+    parser = argparse.ArgumentParser(
+        description="Normalize image_list.txt files to standard '[Tag] path' form."
+    )
+    parser.add_argument(
+        "--root", type=Path, default=DEFAULT_DATASET_ROOT,
+        help="Dataset root containing <noise_level>/<dataset>/<seq>/image_list.txt "
+             "(default: %(default)s).",
+    )
+    parser.add_argument(
+        "--all-noise-levels", action="store_true",
+        help="Scan every <noise_level>/ subdirectory, not just 'clean/'.",
+    )
+    args = parser.parse_args()
 
+    dataset_root: Path = args.root
     if not dataset_root.is_dir():
         print(f"Error: dataset root not found: {dataset_root}")
         sys.exit(1)
 
+    pattern = "*/*/*/image_list.txt" if args.all_noise_levels else "clean/*/*/image_list.txt"
+
     total_converted = 0
     total_files = 0
 
-    # Process all image_list.txt files in clean datasets
-    for txt_file in sorted(dataset_root.glob("clean/*/*/image_list.txt")):
+    for txt_file in sorted(dataset_root.glob(pattern)):
         total_files += 1
         n_converted, status = convert_image_list(txt_file)
         total_converted += n_converted
