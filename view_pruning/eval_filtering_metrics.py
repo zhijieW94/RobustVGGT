@@ -16,7 +16,7 @@ GT_ROOT = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks")
 
 METHODS = ["vggt", "pi3", "mapanything"]
 LEVELS = ["clean", "low_noisy", "mid_noisy", "high_noisy"]
-DATASETS = ["eth3d", "scannetpp_50", "onthego", "phototourism"]
+DATASETS = ["eth3d", "scannet_30", "onthego", "phototourism"]
 
 METRIC_NAMES = ["CleanKeepRate", "DistractorRejectionRate", "F1", "MCC"]
 INT_COLS = {"TP", "FN", "FP", "TN", "N_clean", "N_noisy", "N_kept", "n_sequences"}

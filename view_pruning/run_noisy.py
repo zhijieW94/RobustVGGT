@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Batch-run robust view-pruning methods over noisy testbeds (eth3d / scannetpp_50 / onthego / phototourism).
+"""Batch-run robust view-pruning methods over noisy testbeds (eth3d / scannet_30 / onthego / phototourism).
 
 Noisy dataset layout (unified across the datasets):
     <dataset_root>/<noise_level>/<dataset>/<seq_name>/images/*.jpg
 
 where
     noise_level ∈ {clean, low_noisy, mid_noisy, high_noisy}
-    dataset     ∈ {eth3d, scannetpp_50, onthego, phototourism}
+    dataset     ∈ {eth3d, scannet_30, onthego, phototourism}
 
 For each selected (method, noise_level, dataset, seq), the model is invoked
 on ``<seq_dir>/images`` and results are written to::
@@ -61,7 +61,7 @@ GPU_VISIBILITY_CLEAR_VARS = (
 VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 METHODS = ("vggt", "pi3", "mapanything")
 NOISE_LEVELS = ("clean", "low_noisy", "mid_noisy", "high_noisy")
-DATASETS = ("eth3d", "scannet", "onthego", "phototourism")
+DATASETS = ("eth3d", "scannet_30", "onthego", "phototourism")
 
 
 def _info_print(msg: str) -> None:
