@@ -50,7 +50,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 DEFAULT_DATASET_ROOT = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks")
-DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/Robust_X")
+DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/first_stage")
 
 GPU_VISIBILITY_CLEAR_VARS = (
     "HIP_VISIBLE_DEVICES",
