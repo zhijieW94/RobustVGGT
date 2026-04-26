@@ -57,7 +57,7 @@ from view_pruning.run_noisy import (  # noqa: E402
 
 
 DEFAULT_DATASET_ROOT = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks/7scenes")
-DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/7scenes/robust_x")
+DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/7scenes/robust_x/first_stage")
 
 METHODS = ("vggt", "pi3", "mapanything")
 N_LEVELS = ("N50", "N100", "N150", "N200", "N250", "N300", "N350")
