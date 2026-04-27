@@ -455,11 +455,11 @@ def parse_args() -> argparse.Namespace:
         help="Which datasets to process (default: all).",
     )
     parser.add_argument(
-        "--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT,
+        "--data-root", type=Path, default=DEFAULT_DATASET_ROOT,
         help="Root directory of the noisy testbeds (default: %(default)s).",
     )
     parser.add_argument(
-        "--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT,
+        "--out-root", type=Path, default=DEFAULT_OUTPUT_ROOT,
         help="Root directory for results. Per-run output goes to "
              "<output_root>/<method>/<noise_level>/<dataset>/<seq_name>. "
              "Default: %(default)s.",
