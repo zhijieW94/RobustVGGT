@@ -2,7 +2,7 @@
 """Batch-run robust view-pruning methods over noisy testbeds (eth3d / scannet_30 / onthego / phototourism).
 
 Noisy dataset layout (unified across the datasets):
-    <dataset_root>/<noise_level>/<dataset>/<seq_name>/images/*.jpg
+    <data_root>/<noise_level>/<dataset>/<seq_name>/images/*.jpg
 
 where
     noise_level ∈ {clean, low_noisy, mid_noisy, high_noisy}
@@ -11,7 +11,7 @@ where
 For each selected (method, noise_level, dataset, seq), the model is invoked
 on ``<seq_dir>/images`` and results are written to::
 
-    <output_root>/<method>/<noise_level>/<dataset>/<seq_name>/
+    <out_root>/<method>/<noise_level>/<dataset>/<seq_name>/
 
 Parallelism
 -----------
@@ -49,8 +49,8 @@ SCRIPT_DIR = FILE_PATH.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
-DEFAULT_DATASET_ROOT = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks")
-DEFAULT_OUTPUT_ROOT = Path("/nvmepool/zhijiewu/results/MACV/first_stage")
+DEFAULT_data_root = Path("/nvmepool/zhijiewu/Datasets/Final_Benchmarks")
+DEFAULT_out_root = Path("/nvmepool/zhijiewu/results/MACV/first_stage")
 
 GPU_VISIBILITY_CLEAR_VARS = (
     "HIP_VISIBLE_DEVICES",
@@ -333,7 +333,7 @@ def _gpu_worker_entry(
     method: str,
     args_dict: dict,
     jobs: List[IndexedJob],
-    output_root_str: str,
+    out_root_str: str,
     total_runs: int,
     print_lock,
     result_queue: mp.Queue,
@@ -353,7 +353,7 @@ def _gpu_worker_entry(
         pass
 
     args = argparse.Namespace(**args_dict)
-    output_root = Path(output_root_str)
+    out_root = Path(out_root_str)
     sentinel_name = _sentinel_output_filename(method)
 
     try:
@@ -374,7 +374,7 @@ def _gpu_worker_entry(
     failures: List[Tuple[str, str, str, str]] = []
     for global_idx, noise_level, dataset, seq_name, image_dir_str in jobs:
         image_dir = Path(image_dir_str)
-        out_dir = output_root / method / noise_level / dataset / seq_name
+        out_dir = out_root / method / noise_level / dataset / seq_name
         tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
         log_path = out_dir / "run.log"
 
@@ -455,13 +455,13 @@ def parse_args() -> argparse.Namespace:
         help="Which datasets to process (default: all).",
     )
     parser.add_argument(
-        "--data-root", type=Path, default=DEFAULT_DATASET_ROOT,
+        "--data-root", type=Path, default=DEFAULT_data_root,
         help="Root directory of the noisy testbeds (default: %(default)s).",
     )
     parser.add_argument(
-        "--out-root", type=Path, default=DEFAULT_OUTPUT_ROOT,
+        "--out-root", type=Path, default=DEFAULT_out_root,
         help="Root directory for results. Per-run output goes to "
-             "<output_root>/<method>/<noise_level>/<dataset>/<seq_name>. "
+             "<out_root>/<method>/<noise_level>/<dataset>/<seq_name>. "
              "Default: %(default)s.",
     )
     parser.add_argument(
@@ -530,7 +530,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _collect_jobs(
-    dataset_root: Path,
+    data_root: Path,
     noise_levels: List[str],
     datasets: List[str],
     seq_filter: Optional[List[str]],
@@ -541,7 +541,7 @@ def _collect_jobs(
 
     for noise_level in noise_levels:
         for dataset in datasets:
-            dataset_dir = dataset_root / noise_level / dataset
+            dataset_dir = data_root / noise_level / dataset
             if not dataset_dir.is_dir():
                 _warn_print(
                     f"[WARN] Missing dataset directory: {dataset_dir}; skipping."
@@ -701,19 +701,19 @@ def _report_per_dataset_metrics(
     method: str,
     noise_levels: List[str],
     datasets: List[str],
-    dataset_root: Path,
-    output_root: Path,
+    data_root: Path,
+    out_root: Path,
 ) -> None:
     """Compute and report average metrics grouped by (noise_level, dataset)."""
     import math
 
-    pred_root = output_root / method
+    pred_root = out_root / method
 
     per_seq_metrics: list[dict] = []
 
     for noise in noise_levels:
         for dataset in datasets:
-            gt_ds_dir = dataset_root / noise / dataset
+            gt_ds_dir = data_root / noise / dataset
             if not gt_ds_dir.is_dir():
                 continue
 
@@ -801,14 +801,14 @@ def _report_per_dataset_metrics(
                         for i, (v, w) in enumerate(zip(row, widths))))
 
 
-def _compute_filtering_metrics(output_root: Path) -> None:
+def _compute_filtering_metrics(out_root: Path) -> None:
     """Run eval_filtering_metrics.py to compute metrics after batch processing."""
     script_path = SCRIPT_DIR / "eval_filtering_metrics.py"
     if not script_path.is_file():
         print(f"[warn] metrics script not found: {script_path}")
         return
 
-    pred_root = output_root
+    pred_root = out_root
     metrics_dir = pred_root / "_metrics"
 
     print()
@@ -862,7 +862,7 @@ def _run_method_single_process(
     failures: List[Tuple[str, str, str, str]] = []
     for global_idx, noise_level, dataset, seq_name, image_dir_str in _index_jobs(jobs, method_offset):
         image_dir = Path(image_dir_str)
-        out_dir = args.output_root / method / noise_level / dataset / seq_name
+        out_dir = args.out_root / method / noise_level / dataset / seq_name
         tag = f"{method}/{noise_level}/{dataset}/{seq_name}"
         log_path = out_dir / "run.log"
 
@@ -937,7 +937,7 @@ def _run_method_multi_gpu(
     for gpu_id, chunk in zip(active_gpus, chunks):
         p = ctx.Process(
             target=_gpu_worker_entry,
-            args=(gpu_id, method, args_dict, chunk, str(args.output_root),
+            args=(gpu_id, method, args_dict, chunk, str(args.out_root),
                   total_runs, print_lock, result_queue),
             daemon=False,
         )
@@ -962,13 +962,13 @@ def main() -> None:
     args = parse_args()
 
     jobs = _collect_jobs(
-        args.dataset_root, args.noise_levels, args.datasets, args.sequences
+        args.data_root, args.noise_levels, args.datasets, args.sequences
     )
     if not jobs:
         _warn_print("[ERROR] No sequences to process.")
         sys.exit(1)
 
-    args.output_root.mkdir(parents=True, exist_ok=True)
+    args.out_root.mkdir(parents=True, exist_ok=True)
     gpus = _resolve_gpus(args)
 
     total_runs = len(jobs) * len(args.methods)
@@ -977,7 +977,7 @@ def main() -> None:
         f"noise_levels={args.noise_levels}  datasets={args.datasets}  "
         f"jobs/method={len(jobs)}  total_runs={total_runs}  "
         f"gpus={gpus if gpus else '[single-process]'}  "
-        f"dataset_root={args.dataset_root}  output_root={args.output_root}"
+        f"data_root={args.data_root}  out_root={args.out_root}"
     )
 
     ctx = mp.get_context("spawn") if gpus else None
@@ -998,9 +998,9 @@ def main() -> None:
             )
         for noise_level, dataset, seq_name, msg in method_failures:
             all_failures.append((method, noise_level, dataset, seq_name, msg))
-        _report_per_dataset_metrics(method, args.noise_levels, args.datasets, args.dataset_root, args.output_root)
+        _report_per_dataset_metrics(method, args.noise_levels, args.datasets, args.data_root, args.out_root)
 
-    _compute_filtering_metrics(args.output_root)
+    _compute_filtering_metrics(args.out_root)
 
     succeeded = total_runs - len(all_failures)
     _info_print(f"\n[DONE] Processed {succeeded}/{total_runs} runs successfully.")
