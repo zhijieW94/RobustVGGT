@@ -50,6 +50,7 @@ class ExperimentConfig:
     image_dir: Path
     preprocess_mode: str = "crop"
     exp_name: str = "demo_result"
+    anchor_index: int = 0
     attn_a: float = 0.5
     cos_a: float = 0.5
     rej_thresh: float = 0.4
@@ -721,7 +722,20 @@ class RobustVGGTExperiment:
             [str(p) for p in image_paths],
             mode=self.config.preprocess_mode,
         )
-        
+
+        anchor_index = self.config.anchor_index
+        num_images = len(image_paths)
+        if not (0 <= anchor_index < num_images):
+            raise ValueError(f"Anchor index must be between 0 and {num_images - 1}, got {anchor_index}")
+        if anchor_index != 0:
+            image_paths = [image_paths[anchor_index]] + [p for i, p in enumerate(image_paths) if i != anchor_index]
+            reorder_indices = [anchor_index] + [i for i in range(num_images) if i != anchor_index]
+            if images_tensor.ndim == 4:
+                images_tensor = images_tensor[reorder_indices]
+            elif images_tensor.ndim == 5:
+                images_tensor = images_tensor[:, reorder_indices, ...]
+            info_print(f"[INFO] Selected anchor image index {anchor_index}: {image_paths[0].name}")
+
         try:
             import matplotlib.pyplot as plt
             from torchvision.utils import make_grid
@@ -807,6 +821,12 @@ def parse_args() -> ExperimentConfig:
     )
     parser.set_defaults(use_point_map=True)
     parser.add_argument(
+        "--anchor-index",
+        type=int,
+        default=0,
+        help="Index of the anchor image in the sorted image list (0-based). The selected anchor is moved to the first position for model input.",
+    )
+    parser.add_argument(
         "--conf-threshold-pct", type=float, default=30.0,
         help="Discard the bottom N%% of points by confidence score (0–100, default 30).",
     )
@@ -817,6 +837,7 @@ def parse_args() -> ExperimentConfig:
         image_dir=args.image_dir,
         preprocess_mode=args.preprocess_mode,
         exp_name=args.exp_name,
+        anchor_index=args.anchor_index,
         attn_a=args.attn_a,
         cos_a=args.cos_a,
         rej_thresh=args.rej_thresh,
