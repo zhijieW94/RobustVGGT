@@ -28,6 +28,82 @@ from PIL import Image
 FILE_PATH = Path(__file__).resolve()
 REPO_ROOT = FILE_PATH.parents[2]
 
+# ── Lightweight profiling helpers ────────────────────────────────────────────
+_PROFILE_TIMES: Dict[str, float] = {}
+_PROFILE_CALLS: Dict[str, int] = {}
+
+
+def _timed(label: str, fn):
+    """Run ``fn`` and accumulate its wall-clock (GPU-accurate) time under ``label``."""
+    if torch.cuda.is_available():
+        ev_start = torch.cuda.Event(enable_timing=True)
+        ev_end = torch.cuda.Event(enable_timing=True)
+        ev_start.record()
+        out = fn()
+        ev_end.record()
+        torch.cuda.synchronize()
+        dt = ev_start.elapsed_time(ev_end) / 1000.0  # ms -> s
+    else:
+        t0 = time.perf_counter()
+        out = fn()
+        dt = time.perf_counter() - t0
+    _PROFILE_TIMES[label] = _PROFILE_TIMES.get(label, 0.0) + dt
+    _PROFILE_CALLS[label] = _PROFILE_CALLS.get(label, 0) + 1
+    return out
+
+
+def _phase_start() -> float:
+    """Sync the GPU and return a start timestamp for a coarse-grained phase timer."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _phase_end(label: str, t0: float) -> None:
+    """Close a phase timer opened with ``_phase_start`` and accumulate its time."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    _PROFILE_TIMES[label] = _PROFILE_TIMES.get(label, 0.0) + dt
+    _PROFILE_CALLS[label] = _PROFILE_CALLS.get(label, 0) + 1
+
+
+def _report_profile(function_total_s: float) -> None:
+    """Print a summary table of accumulated profiling timings.
+
+    Rows tagged ``[phase]`` are non-overlapping coarse-grained blocks that tile
+    ``_forward_once``; other rows are fine-grained ops nested inside a phase.
+    The top-3 time-consuming phases are flagged with ``<== #k``.
+    """
+    W = 56
+    phases = {k: v for k, v in _PROFILE_TIMES.items() if k.startswith("[phase]")}
+    ops = {k: v for k, v in _PROFILE_TIMES.items() if not k.startswith("[phase]")}
+    phase_sorted = sorted(phases.items(), key=lambda kv: kv[1], reverse=True)
+    top3 = {k for k, _ in phase_sorted[:3]}
+    accounted = sum(phases.values())
+    other = max(function_total_s - accounted, 0.0)
+
+    def _row(label, total, n, tag=""):
+        avg_ms = (total / n * 1000.0) if n else 0.0
+        pct = (total / function_total_s * 100.0) if function_total_s else 0.0
+        print(f"{label:<{W}}{n:>6}{total:>11.4f}{avg_ms:>12.3f}{pct:>8.1f}%  {tag}")
+
+    print(f"\n{ANSI_GREEN}===================== PROFILING SUMMARY ====================={ANSI_RESET}")
+    print(f"{'Component':<{W}}{'calls':>6}{'tot(s)':>11}{'avg(ms)':>12}{'share':>8}")
+    print("-" * (W + 40))
+    print("PHASES (non-overlapping, tile the whole function):")
+    for rank, (label, total) in enumerate(phase_sorted, 1):
+        tag = f"<== TOP {rank}" if label in top3 else ""
+        _row("  " + label.replace("[phase] ", ""), total, _PROFILE_CALLS.get(label, 0), tag)
+    _row("  [unattributed / other]", other, 1)
+    print("-" * (W + 40))
+    print("FINE-GRAINED OPS (nested inside a phase above):")
+    for label, total in sorted(ops.items(), key=lambda kv: kv[1], reverse=True):
+        _row("  " + label, total, _PROFILE_CALLS.get(label, 0))
+    print("-" * (W + 40))
+    _row("_forward_once (WHOLE FUNCTION)", function_total_s, 1)
+    print(f"{ANSI_GREEN}============================================================={ANSI_RESET}\n")
+
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -180,6 +256,13 @@ class RobustVGGTExperiment:
         import torch.nn.functional as F
         from typing import List, Optional
 
+        # ── Profiling: reset accumulators and start the whole-function timer ──
+        _PROFILE_TIMES.clear()
+        _PROFILE_CALLS.clear()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _forward_once_t0 = time.perf_counter()
+
         non_blocking = device.type == "cuda"
         images_device = images.to(device=device, non_blocking=non_blocking)
         if device.type == "cuda":
@@ -208,16 +291,20 @@ class RobustVGGTExperiment:
             handles.append(blk.q_norm.register_forward_hook(_make_hook(q_out, i)))
             handles.append(blk.k_norm.register_forward_hook(_make_hook(k_out, i)))
 
+        _p = _phase_start()
         with torch.inference_mode():
             if device.type == "cuda":
                 with torch.cuda.amp.autocast(dtype=self.amp_dtype):
                     predictions, aggregated_tokens_list = self.model(images_device)
             else:
                 predictions, aggregated_tokens_list = self.model(images_device)
+        _phase_end("[phase] 1st forward pass (model, 60 imgs)", _p)
 
+        _p = _phase_start()
         prediction_save_path = self.pair_out_dir / f"predictions_first_forward.npz"
         save_predictions = {k: v.float().cpu() for k, v in predictions.items() if torch.is_tensor(v)}
         np.savez(prediction_save_path, **save_predictions)
+        _phase_end("[phase] save predictions_first_forward.npz", _p)
 
         '''
         aggregated_tokens_list: features from all layers (list of tensors). 
@@ -237,8 +324,9 @@ class RobustVGGTExperiment:
             
         cosine_similarities = []
         num_images_total = images.shape[0]
-        reject_flags = [False] * num_images_total  
+        reject_flags = [False] * num_images_total
         layer_feat = ref_feat = ref_feat_norm = layer_feat_norm = cos_sim = cos_sim_mean = None
+        _p = _phase_start()
         for layer_idx, feature in enumerate(global_tokens):
             if feature.ndim != 4:
                 continue
@@ -255,17 +343,22 @@ class RobustVGGTExperiment:
             ref_feat = layer_feat[0:1, :, :]  # (1, T, C)
             ref_feat_norm = F.normalize(ref_feat, p=2, dim=-1)  # (1, T, C)
             layer_feat_norm = F.normalize(layer_feat, p=2, dim=-1)  # (B*N, T, C)
-            cos_sim = torch.einsum("bic,bjc->bij", layer_feat_norm, ref_feat_norm)  # (B*N, T, T)
+            cos_sim = _timed(
+                "Feature similarity score (einsum, L258)",
+                lambda: torch.einsum("bic,bjc->bij", layer_feat_norm, ref_feat_norm),
+            )  # (B*N, T, T)
             
             cos_sim = ((cos_sim + 1.0) / 2.0).clamp(0.0, 1.0)  # Normalize to [0, 1]
             
             cos_sim_mean = cos_sim.mean(-1).mean(-1)  # (B*N,)
             cosine_similarities.append(cos_sim_mean)  # List of (N,)
-        
+        _phase_end("[phase] feature-similarity loop (cos-sim)", _p)
+
         global_tokens = None
         aggregated_tokens_selected = None
         safe_empty_cache()
-        
+
+        _p = _phase_start()
         predictions_full = predictions
         try:
             if isinstance(predictions_full, dict):
@@ -276,8 +369,10 @@ class RobustVGGTExperiment:
             pass
         safe_empty_cache()
         torch.cuda.empty_cache()
+        _phase_end("[phase] move 1st-forward predictions to CPU", _p)
 
         # Extract first-round predictions for PLY (before filtering)
+        _p = _phase_start()
         first_pose_enc = predictions_full["pose_enc"]
         first_ext_raw, first_int_raw = pose_encoding_to_extri_intri(first_pose_enc, image_hw)
         first_ext_raw = first_ext_raw.squeeze(0) if first_ext_raw.ndim == 4 else first_ext_raw
@@ -294,6 +389,7 @@ class RobustVGGTExperiment:
         if "world_points_conf" in predictions_full and torch.is_tensor(predictions_full["world_points_conf"]):
             wpc = predictions_full["world_points_conf"]
             first_world_points_conf_cpu = (wpc.squeeze(0) if wpc.ndim == 4 else wpc).detach().cpu().float()
+        _phase_end("[phase] extract 1st-round preds (pose decode + .cpu)", _p)
 
         global_mean_vals = []
         for h in handles:
@@ -346,6 +442,7 @@ class RobustVGGTExperiment:
         first_image_patch_start = patch_start_idx
         first_image_patch_end = first_image_patch_start + num_patch_tokens
 
+        _p = _phase_start()
         for i in tqdm(attn_layers):
             if i not in q_out or i not in k_out:
                 continue
@@ -362,8 +459,14 @@ class RobustVGGTExperiment:
             Tk = int(min(num_vis, num_images_in_seq) * tokens_per_image)              # (Tk)
             K_slice = K[:, :, :Tk, :]                                                # (B, H, Tk, D)
             scale = 1.0 / math.sqrt(float(q_first_image.shape[-1]))
-            logits = torch.einsum("bhqd,bhtd->bhqt", q_first_image, K_slice) * scale  # (B, H, Nq, Tk)
-            probs = torch.softmax(logits, dim=-1)                                      # (B, H, Nq, Tk)
+            logits = _timed(
+                "Attention score (QK einsum, L365)",
+                lambda: torch.einsum("bhqd,bhtd->bhqt", q_first_image, K_slice) * scale,
+            )  # (B, H, Nq, Tk)
+            probs = _timed(
+                "Attention score (softmax, L366)",
+                lambda: torch.softmax(logits, dim=-1),
+            )                                                                          # (B, H, Nq, Tk)
             attn_first_image = probs.mean(dim=1).mean(dim=1)[0]                        # (Tk,)
 
             import matplotlib.pyplot as plt
@@ -444,7 +547,8 @@ class RobustVGGTExperiment:
             except Exception:
                 pass
             torch.cuda.empty_cache()
-                
+        _phase_end("[phase] attention-vis loop (QK+softmax+interp+numpy)", _p)
+
         if global_mean_vals and cosine_similarities:
             cos_sim = cosine_similarities[0]  # (N,)
             attn_val = torch.tensor(global_mean_vals, device=cos_sim.device, dtype=cos_sim.dtype)  # (N,)
@@ -562,17 +666,21 @@ class RobustVGGTExperiment:
                     print(f"[WARN] Failed to save second-round images: {_e}")
 
                 images_subset = images_subset_cpu.to(device=device, dtype=self.amp_dtype, non_blocking=non_blocking)
-        
+
+                _p = _phase_start()
                 with torch.inference_mode():
                     if device.type == "cuda":
                         with torch.cuda.amp.autocast(dtype=self.amp_dtype):
                             predictions_survive, _ = self.model(images_subset)
                     else:
                         predictions_survive, _ = self.model(images_subset)
-                
+                _phase_end("[phase] 2nd forward pass (model, survivors)", _p)
+
+                _p = _phase_start()
                 prediction_save_path = self.pair_out_dir / f"predictions_survived.npz"
                 save_predictions = {k: v.float().cpu() for k, v in predictions_survive.items() if torch.is_tensor(v)}
                 np.savez(prediction_save_path, **save_predictions)
+                _phase_end("[phase] save predictions_survived.npz", _p)
 
                 try:
                     if isinstance(predictions_survive, dict):
@@ -595,6 +703,7 @@ class RobustVGGTExperiment:
             np.savez(prediction_save_path, **save_predictions)
             predictions = predictions_full
 
+        _p = _phase_start()
         pose_enc = predictions["pose_enc"]
         extrinsics, intrinsics = pose_encoding_to_extri_intri(pose_enc, image_hw)
         extrinsics = extrinsics.squeeze(0) if extrinsics.ndim == 4 else extrinsics
@@ -615,12 +724,20 @@ class RobustVGGTExperiment:
             wpc = predictions["world_points_conf"]
             world_points_conf_cpu = (wpc.squeeze(0) if wpc.ndim == 4 else wpc).detach().cpu().float()
 
+        _phase_end("[phase] final pose/world-points extraction", _p)
+
         del predictions
         try:
             del images_device
         except Exception:
             pass
         safe_empty_cache()
+
+        # ── Profiling: stop the whole-function timer and print the summary ──
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _forward_once_total = time.perf_counter() - _forward_once_t0
+        _report_profile(_forward_once_total)
 
         return (
             result, depth, conf, intrinsics_cpu, extrinsics_cpu,
